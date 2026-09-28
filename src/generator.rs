@@ -63,10 +63,17 @@ pub struct Generator {
     entropy_len: usize,
     /// 派生路径（原样字符串，用于命中记录）
     path: String,
-    /// 解析后的派生索引（hardened 已置高位）
-    path_indices: Vec<u32>,
+    /// 预解析的 BIP32 子索引（LICM：路径对 Generator 是循环不变量，
+    /// 原先在每轮 `derive_and_match` 里重复 `ChildNumber::new` 解析校验；
+    /// 外提到构造期一次完成。原始索引由 Config 持有，此处仅保留解析结果）
+    path_cns: Vec<ChildNumber>,
     /// 大小写敏感：每轮额外计算 EIP-55 校验和形式参与匹配
     case_sensitive: bool,
+    /// 每个助记词派生的地址数（BIP32 末层连续索引，MetaMask 多账户同款设计）：
+    /// 1 次昂贵的 BIP39 种子派生（2048 轮 PBKDF2）+ N 次廉价的末层派生，
+    /// 单核吞吐约提升 N/(1+N/15) 倍（实测见 docs/performance.md）。
+    /// 默认 1：每个地址独立助记词（旧行为）。
+    derive_batch: u32,
 }
 
 impl Generator {
@@ -93,13 +100,35 @@ impl Generator {
                 ))
             }
         };
+        // LICM 外提：路径固定，构造期一次性解析 ChildNumber（含合法性校验）
+        let mut path_cns = Vec::with_capacity(path_indices.len());
+        for &idx in path_indices {
+            let hardened = (idx & 0x8000_0000) != 0;
+            let cn = ChildNumber::new(idx & 0x7FFF_FFFF, hardened).map_err(|e| {
+                VanityError::config(
+                    format!("invalid BIP32 child number {idx:#010x}: {e}"),
+                    format!("非法 BIP32 子索引 {idx:#010x}：{e}"),
+                )
+            })?;
+            path_cns.push(cn);
+        }
         Ok(Self {
             word_count,
             entropy_len,
             path: path.to_string(),
-            path_indices: path_indices.to_vec(),
+            path_cns,
             case_sensitive,
+            derive_batch: 1,
         })
+    }
+
+    /// 设置每个助记词派生的地址数（构造器风格，默认 1）。
+    ///
+    /// 当 batch 大于 1 时要求派生路径至少含一层索引：末层按 0,1,2… 连续派生
+    /// （保留原末层的 hardened 属性）。
+    pub fn with_derive_batch(mut self, batch: u32) -> Self {
+        self.derive_batch = batch.max(1);
+        self
     }
 
     /// 词数
@@ -111,7 +140,10 @@ impl Generator {
     ///
     /// 返回 `Some(HitRecord)` 表示命中；未命中时所有敏感数据已擦除。
     /// 熵源失败时 fail-closed：显式报错终止，绝不降级到弱熵源。
-    pub fn try_once(&mut self, matcher: &Matcher) -> Result<Option<HitRecord>, VanityError> {
+    pub fn try_once(
+        &mut self,
+        matcher: &Matcher,
+    ) -> Result<(Vec<HitRecord>, u32), VanityError> {
         // 1. OsRng 熵（Zeroizing 包裹；只暴露前 entropy_len 字节给管线）
         let mut entropy = Zeroizing::new([0u8; MAX_ENTROPY]);
         OsRng
@@ -133,7 +165,7 @@ impl Generator {
         &mut self,
         entropy: &[u8],
         matcher: &Matcher,
-    ) -> Result<Option<HitRecord>, VanityError> {
+    ) -> Result<(Vec<HitRecord>, u32), VanityError> {
         // 防御：熵长必须与词数严格一致（测试注入路径同样受限）
         if entropy.len() != self.entropy_len {
             return Err(VanityError::internal(
@@ -163,78 +195,130 @@ impl Generator {
         // 3. 种子（空 passphrase，与 MetaMask 行为对齐；内部 2048 轮 PBKDF2-HMAC-SHA512）
         let seed = Zeroizing::new(mnemonic.to_seed(""));
 
-        // 4. BIP32 派生（hardened 位 = 0x8000_0000）
+        // 4. BIP32 派生（hardened 位 = 0x8000_0000）；
+        //    ChildNumber 已在构造期预解析（LICM 外提），热路径直接复用。
+        //    derive_batch > 1 时：倒数第二层结果在同一助记词内复用，
+        //    末层按 0,1,2… 连续派生（一次昂贵的种子派生摊薄到 N 个地址）
         let mut xprv = XPrv::new(seed.as_ref()).map_err(|e| {
             VanityError::internal(
                 format!("bip32 master key derivation failed: {e}"),
                 format!("BIP32 主密钥派生失败：{e}"),
             )
         })?;
-        for &idx in &self.path_indices {
-            let hardened = (idx & 0x8000_0000) != 0;
-            let cn = ChildNumber::new(idx & 0x7FFF_FFFF, hardened).map_err(|e| {
-                VanityError::internal(
-                    format!("invalid BIP32 child number: {e}"),
-                    format!("非法 BIP32 子索引：{e}"),
-                )
-            })?;
+        // 父层统一只派生到倒数第二层：末层交给逐地址循环（batch=1 时
+        // 子索引 = 原末层索引，行为与旧版完全一致）
+        let parent_cns = &self.path_cns[..self.path_cns.len().saturating_sub(1)];
+        for &cn in parent_cns {
             xprv = xprv.derive_child(cn).map_err(|e| {
                 VanityError::internal(
-                    format!("bip32 child derivation failed at index {idx:#010x}: {e}"),
-                    format!("BIP32 第 {idx:#010x} 层派生失败：{e}"),
+                    format!("bip32 child derivation failed: {e}"),
+                    format!("BIP32 子密钥派生失败：{e}"),
                 )
             })?;
         }
+        // 末层：派生 derive_batch 个连续子索引（保留原末层 hardened 属性）
+        let last = self.path_cns.last();
+        let (last_idx, last_hardened) = match last {
+            Some(cn) => (cn.index(), cn.is_hardened()),
+            // 路径无索引（"m"）：批次恒为 1，走单次路径
+            None => (0, false),
+        };
 
-        // 5. 私钥范围检查 [1, n-1]：from_slice 拒绝 0 与 ≥n
-        let sk = SecretKey::from_slice(xprv.to_bytes().as_slice()).map_err(|e| {
-            VanityError::internal(
-                format!("derived private key rejected by secp256k1: {e}"),
-                format!("派生私钥未通过 secp256k1 范围检查：{e}"),
-            )
-        })?;
+        // 5..9 逐地址：末层派生 → 私钥 → 公钥 → Keccak → 匹配 →（命中）记录
+        let mut hits = Vec::new();
+        let batch = if self.path_cns.is_empty() {
+            1 // 路径无索引（"m"）时无从批量
+        } else {
+            self.derive_batch
+        };
+        for i in 0..batch {
+            // 末层子密钥：基索引 + i（保留原末层 hardened 属性）
+            let child_xprv = if self.path_cns.is_empty() {
+                xprv.clone()
+            } else {
+                let cn = ChildNumber::new(last_idx + i, last_hardened).map_err(|e| {
+                    VanityError::internal(
+                        format!("invalid BIP32 child number {:#010x}: {e}", last_idx + i),
+                        format!("非法 BIP32 子索引 {:#010x}：{e}", last_idx + i),
+                    )
+                })?;
+                xprv.derive_child(cn).map_err(|e| {
+                    VanityError::internal(
+                        format!("bip32 child derivation failed: {e}"),
+                        format!("BIP32 子密钥派生失败：{e}"),
+                    )
+                })?
+            };
 
-        // 6. 公钥（未压缩 65 字节：04 || x || y，取 x||y 共 64 字节）
-        let point = sk.public_key().as_affine().to_encoded_point(false);
-        let xy = point.as_bytes().get(1..65).ok_or_else(|| {
-            VanityError::internal("unexpected SEC1 encoding length", "SEC1 编码长度异常")
-        })?;
+            // 6. 私钥范围检查 [1, n-1]：from_slice 拒绝 0 与 ≥n
+            let sk = SecretKey::from_slice(child_xprv.to_bytes().as_slice()).map_err(|e| {
+                VanityError::internal(
+                    format!("derived private key rejected by secp256k1: {e}"),
+                    format!("派生私钥未通过 secp256k1 范围检查：{e}"),
+                )
+            })?;
 
-        // 7. Keccak-256 → 后 20 字节 → 小写 hex 到栈上缓冲（零堆分配）
-        let mut digest = [0u8; 32];
-        let mut keccak = Keccak::v256();
-        keccak.update(xy);
-        keccak.finalize(&mut digest);
-        let mut hex40 = [0u8; 40];
-        hex::encode_to_slice(&digest[12..32], hex40.as_mut()).map_err(|e| {
-            VanityError::internal(
-                format!("hex encoding failed: {e}"),
-                format!("地址 hex 编码失败：{e}"),
-            )
-        })?;
+            // 7. 公钥（未压缩 65 字节：04 || x || y，取 x||y 共 64 字节）
+            let point = sk.public_key().as_affine().to_encoded_point(false);
+            let xy = point.as_bytes().get(1..65).ok_or_else(|| {
+                VanityError::internal("unexpected SEC1 encoding length", "SEC1 编码长度异常")
+            })?;
 
-        // 8. 匹配判定（front → back → middle 分层剪枝）
-        //    大小写敏感模式：额外计算 EIP-55 校验和形式（栈上缓冲，零堆分配）
-        if self.case_sensitive {
-            let mut checksum = [0u8; 40];
-            eip55_into(&hex40, &mut checksum);
-            if !matcher.matches(&hex40, Some(&checksum)) {
-                // 未命中：entropy / seed / xprv 随作用域结束擦除，不留敏感数据
-                return Ok(None);
+            // 8. Keccak-256 → 后 20 字节 → 小写 hex 到栈上缓冲（零堆分配）
+            let mut digest = [0u8; 32];
+            let mut keccak = Keccak::v256();
+            keccak.update(xy);
+            keccak.finalize(&mut digest);
+            let mut hex40 = [0u8; 40];
+            hex::encode_to_slice(&digest[12..32], hex40.as_mut()).map_err(|e| {
+                VanityError::internal(
+                    format!("hex encoding failed: {e}"),
+                    format!("地址 hex 编码失败：{e}"),
+                )
+            })?;
+
+            // 9. 匹配判定（front → back → middle 分层剪枝）
+            //    大小写敏感模式：额外计算 EIP-55 校验和形式（栈上缓冲，零堆分配）
+            let matched = if self.case_sensitive {
+                let mut checksum = [0u8; 40];
+                eip55_into(&hex40, &mut checksum);
+                matcher.matches(&hex40, Some(&checksum))
+            } else {
+                matcher.matches(&hex40, None)
+            };
+            if !matched {
+                continue; // 未命中：跳过该地址，敏感数据随迭代结束擦除
             }
-        } else if !matcher.matches(&hex40, None) {
-            return Ok(None);
-        }
 
-        // 9. 命中：计算 EIP-55 校验和并构造记录
-        let address = eip55_checksum_address(&hex40);
-        let mnemonic_phrase = Zeroizing::new(mnemonic.to_string());
-        Ok(Some(HitRecord {
-            address,
-            path: self.path.clone(),
-            mnemonic: mnemonic_phrase,
-            created: iso8601_utc_now(),
-        }))
+            // 10. 命中：计算 EIP-55 校验和并构造记录
+            //     path 标注命中地址的真实派生索引（同助记词的第 i 个账户）
+            let address = eip55_checksum_address(&hex40);
+            let mnemonic_phrase = Zeroizing::new(mnemonic.to_string());
+            let record_path = if batch > 1 {
+                self.path_with_child(last_idx + i, last_hardened)
+            } else {
+                self.path.clone()
+            };
+            hits.push(HitRecord {
+                address,
+                path: record_path,
+                mnemonic: mnemonic_phrase,
+                created: iso8601_utc_now(),
+            });
+        }
+        // 敏感数据显式擦除由 Zeroizing/bip39 zeroize 特性在作用域结束时完成
+        Ok((hits, batch))
+    }
+
+    /// 命中地址的完整派生路径字符串（末层索引替换为实际账户索引）
+    fn path_with_child(&self, idx: u32, hardened: bool) -> String {
+        let base_end = self.path.rfind('/').map_or(0, |p| p + 1);
+        format!(
+            "{}{}{}",
+            &self.path[..base_end],
+            idx,
+            if hardened { "'" } else { "" }
+        )
     }
 }
 
@@ -404,7 +488,8 @@ mod tests {
     fn 确定性派生_24词全abandon_默认路径地址() {
         let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
         let m = Matcher::new(false, None, None, None); // 全条件匹配器，必然命中
-        let hit = g.derive_and_match(&[0u8; 32], &m).unwrap().expect("应命中");
+        let (hits, _) = g.derive_and_match(&[0u8; 32], &m).unwrap();
+        let hit = &hits[0];
         assert_eq!(hit.address, "0xF278cF59F82eDcf871d630F28EcC8056f25C1cdb");
         assert_eq!(hit.path, "m/44'/60'/0'/0/0");
         assert_eq!(*hit.mnemonic, MNEMONIC_24);
@@ -417,11 +502,13 @@ mod tests {
         let m = Matcher::new(false, None, None, None);
 
         let mut g12 = Generator::new(12, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
-        let hit12 = g12.derive_and_match(&[0u8; 16], &m).unwrap().expect("应命中");
+        let (hits12, _) = g12.derive_and_match(&[0u8; 16], &m).unwrap();
+        let hit12 = &hits12[0];
         assert_eq!(hit12.address, "0x9858EfFD232B4033E47d90003D41EC34EcaEda94");
 
         let mut g18 = Generator::new(18, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
-        let hit18 = g18.derive_and_match(&[0u8; 24], &m).unwrap().expect("应命中");
+        let (hits18, _) = g18.derive_and_match(&[0u8; 24], &m).unwrap();
+        let hit18 = &hits18[0];
         assert_eq!(hit18.address, "0x197A1bEE163923815Ba58EaD0F14B3Fcd8C5926d");
     }
 
@@ -433,7 +520,8 @@ mod tests {
         let mut g217 =
             Generator::new(24, "m/44'/60'/0'/0/217", &[0x8000_002C, 0x8000_003C, 0x8000_0000, 0, 217], false)
                 .unwrap();
-        let hit = g217.derive_and_match(&[0u8; 32], &m).unwrap().expect("应命中");
+        let (hits, _) = g217.derive_and_match(&[0u8; 32], &m).unwrap();
+        let hit = &hits[0];
         assert_eq!(hit.address, "0xCaCFFdD18ecD36cac714cC9457fc508008f222b2");
 
         let mut gdeep = Generator::new(
@@ -443,7 +531,8 @@ mod tests {
             false,
         )
         .unwrap();
-        let hit = gdeep.derive_and_match(&[0u8; 32], &m).unwrap().expect("应命中");
+        let (hits_deep, _) = gdeep.derive_and_match(&[0u8; 32], &m).unwrap();
+        let hit = &hits_deep[0];
         assert_eq!(hit.address, "0xeD0092C60c525E6DB9c131F5971Ed5Fed05E496C");
     }
 
@@ -478,9 +567,9 @@ mod tests {
         let m = Matcher::new(false, None, None, None);
         let mut a = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
         let mut b = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
-        let ra = a.derive_and_match(&[7u8; 32], &m).unwrap().unwrap();
-        let rb = b.derive_and_match(&[7u8; 32], &m).unwrap().unwrap();
-        assert_eq!(ra.address, rb.address);
+        let (ra, _) = a.derive_and_match(&[7u8; 32], &m).unwrap();
+        let (rb, _) = b.derive_and_match(&[7u8; 32], &m).unwrap();
+        assert_eq!(ra[0].address, rb[0].address);
     }
 
     /// 私钥边界：0 与 n（曲线阶）必须被拒绝；n-1 是合法私钥（BIP32 语义：
@@ -530,9 +619,58 @@ mod tests {
         let m = Matcher::new(false, Some(b"ffff".to_vec()), None, None);
         let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
         for _ in 0..50 {
-            let r = g.try_once(&m).unwrap();
-            assert!(r.is_none(), "ffff 前缀在 50 次内命中概率约 2^-196，不应命中");
+            let (r, _) = g.try_once(&m).unwrap();
+            assert!(r.is_empty(), "ffff 前缀在 50 次内命中概率约 2^-196，不应命中");
         }
+    }
+
+    /// derive_batch 批派生：同一助记词派生 0..3 四个连续地址，
+    /// 与独立实例逐路径派生的结果完全一致（确定性交叉验证）
+    #[test]
+    fn derive_batch_批派生与逐路径一致() {
+        let m = Matcher::new(false, None, None, None);
+        let entropy = [5u8; 32];
+        // 批派生：一个助记词 → 4 个地址
+        let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false)
+            .unwrap()
+            .with_derive_batch(4);
+        let (hits, checked) = g.derive_and_match(&entropy, &m).unwrap();
+        assert_eq!(checked, 4);
+        assert_eq!(hits.len(), 4, "全条件匹配器应命中全部 4 个派生地址");
+        // 逐路径独立派生：m/44'/60'/0'/0/{0..3}
+        for i in 0..4u32 {
+            let indices = [0x8000_002C, 0x8000_003C, 0x8000_0000, 0, i];
+            let mut gi = Generator::new(24, &format!("m/44'/60'/0'/0/{i}"), &indices, false).unwrap();
+            let (hi, _) = gi.derive_and_match(&entropy, &m).unwrap();
+            assert_eq!(hits[i as usize].address, hi[0].address, "账户 {i} 地址应一致");
+            assert_eq!(hits[i as usize].path, format!("m/44'/60'/0'/0/{i}"));
+            assert_eq!(*hits[i as usize].mnemonic, *hi[0].mnemonic, "同一助记词");
+        }
+    }
+
+    /// derive_batch=1（默认）：行为与旧版一致，path 为配置原样
+    #[test]
+    fn derive_batch_默认1路径原样() {
+        let m = Matcher::new(false, None, None, None);
+        let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false).unwrap();
+        let (hits, checked) = g.derive_and_match(&[0u8; 32], &m).unwrap();
+        assert_eq!(checked, 1);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "m/44'/60'/0'/0/0");
+    }
+
+    /// 末层 hardened 路径的批派生：子索引保留 hardened 属性
+    #[test]
+    fn derive_batch_hardened末层() {
+        let m = Matcher::new(false, None, None, None);
+        let indices = [0x8000_002C, 0x8000_003C, 0x8000_0000, 0x8000_0005];
+        let mut g = Generator::new(24, "m/44'/60'/0'/0/5'", &indices, false)
+            .unwrap()
+            .with_derive_batch(2);
+        let (hits, _) = g.derive_and_match(&[1u8; 32], &m).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].path, "m/44'/60'/0'/0/5'");
+        assert_eq!(hits[1].path, "m/44'/60'/0'/0/6'");
     }
 
     /// 熵长度不匹配：12 词生成器注入 32 字节熵应报内部错误而非 panic

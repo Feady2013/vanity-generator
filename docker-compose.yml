@@ -1,0 +1,26 @@
+# docker compose up -d 即可启动靓号搜索
+#
+# 运行逻辑：启动 → 读取 /config/config.yaml → 持续搜索直到命中 count 个地址
+#           → 加密资产（vanity_*.asc）写入 /config（即宿主机 ./config）
+#           → 进程正常退出（exit 0）→ 容器停止且不再重启（restart: "no"）
+#
+# 安全：network_mode: "none" 完全禁用网络（本程序无需任何网络访问）；
+#       资源限制：2 核 CPU / 512MB 内存
+services:
+  vanity-generator:
+    image: ghcr.io/sweetsky123/vanity-generator:latest
+    # 中国大陆机器拉取 ghcr 慢时可用本地构建（首次自动 build）：
+    # build: .
+    container_name: vanity-generator
+    restart: "no" # 跑完目标自行退出后保持停止，不重启不拉取
+    network_mode: "none" # 禁用网络：熵源/加密/输出均不需要联网
+    volumes:
+      - ./config:/config
+    command: ["--config", "/config/config.yaml"]
+    deploy:
+      resources:
+        limits:
+          cpus: "2"
+          memory: 512M
+# 使用前：把 config.yaml 与 GPG 公钥（gpg.asc）放进 ./config/，
+# config.yaml 中 gpg_key_file 填 /config/gpg.asc（绝对路径）。

@@ -80,6 +80,10 @@ struct RawConfig {
     path: Option<String>,
     count: u64,
     gpg_key_file: Option<String>,
+    /// 自定义工作线程数（1..=1024）；未定义时按 CPU 逻辑核心数自动分配
+    threads: Option<u32>,
+    /// 每个助记词派生的地址数（1..=1000，BIP32 末层连续索引）
+    derive_batch: Option<u32>,
 }
 
 /// 校验完成后的最终配置（所有字段已归一化）
@@ -103,6 +107,12 @@ pub struct Config {
     pub path_indices: Vec<u32>,
     /// 目标命中数量
     pub count: u32,
+    /// 自定义工作线程数（1..=1024）；None = 按 CPU 逻辑核心数自动分配
+    pub threads: Option<u32>,
+    /// 每个助记词派生的地址数（默认 1 = 每地址独立助记词）
+    pub derive_batch: u32,
+    /// 输出目录：跟随 config.yaml 所在目录（env 注入时 = exe 目录）
+    pub output_dir: PathBuf,
     /// GPG 公钥文件路径（env 提供时为 None）
     pub gpg_key_path: Option<PathBuf>,
     /// GPG 公钥内联内容（env 提供时为 Some）
@@ -113,16 +123,21 @@ impl Config {
     /// 按优先级加载配置：CLI 路径 > `VANITY_CONFIG` 环境变量 > exe 同目录 config.yaml。
     /// `gpg_env` 为 `VANITY_GPG_KEY` 的内容（调用方读取环境变量后传入，便于测试）。
     pub fn load(cli_path: Option<&Path>, exe_dir: &Path, gpg_env: Option<&str>) -> Result<Self, VanityError> {
-        let (text, source) = match cli_path {
+        let (text, source, cfg_dir) = match cli_path {
             Some(p) => (
                 fs::read_to_string(p).map_err(|e| VanityError::config(
                     format!("failed to read config file {}: {e}. Please check the path and permissions.", p.display()),
                     format!("读取配置文件 {} 失败：{e}。请检查路径与读取权限。", p.display()),
                 ))?,
                 format!("文件 {}", p.display()),
+                // 配置文件所在目录：输出与相对公钥路径的基准
+                p.parent().filter(|d| !d.as_os_str().is_empty()).map_or_else(
+                    || PathBuf::from("."),
+                    |d| d.to_path_buf(),
+                ),
             ),
             None => match std::env::var(ENV_CONFIG) {
-                Ok(v) if !v.trim().is_empty() => (v, format!("环境变量 {ENV_CONFIG}")),
+                Ok(v) if !v.trim().is_empty() => (v, format!("环境变量 {ENV_CONFIG}"), exe_dir.to_path_buf()),
                 _ => {
                     let p = exe_dir.join("config.yaml");
                     (
@@ -140,11 +155,12 @@ impl Config {
                             ),
                         ))?,
                         format!("文件 {}", p.display()),
+                        exe_dir.to_path_buf(),
                     )
                 }
             },
         };
-        Self::parse_and_validate(&text, exe_dir, gpg_env).map_err(|e| {
+        Self::parse_and_validate(&text, &cfg_dir, gpg_env).map_err(|e| {
             // 附带配置来源，帮助用户定位（不回显内容）
             VanityError::config(
                 format!("config source: {source}. {}", e.en),
@@ -316,6 +332,51 @@ impl Config {
             },
         };
 
+        // 8. derive_batch：每助记词派生地址数（1..=1000；>1 需路径含索引）
+        let derive_batch = match raw.derive_batch {
+            None | Some(1) => 1,
+            Some(b) if !(2..=1000).contains(&b) => {
+                return Err(VanityError::config(
+                    format!(
+                        "derive_batch must be between 1 and 1000, got {b}. \
+                         Use 1 for an independent mnemonic per address (default)."
+                    ),
+                    format!(
+                        "derive_batch 必须介于 1 到 1000 之间，当前为 {b}。\
+                         默认 1 = 每个地址独立助记词。"
+                    ),
+                ));
+            }
+            Some(b) => b,
+        };
+
+        // 8.5 批派生需要路径含末层索引
+        if derive_batch > 1 && path_indices.is_empty() {
+            return Err(VanityError::config(
+                "derive_batch > 1 requires the derivation path to contain at least one index \
+                 (e.g. m/44'/60'/0'/0/0); the last level is expanded per address.",
+                "derive_batch > 1 要求派生路径至少含一层索引（如 m/44'/60'/0'/0/0），\
+                 末层索引将按 0,1,2… 连续派生。",
+            ));
+        }
+
+        // 9. threads：可选工作线程数（1..=1024）
+        if let Some(t) = raw.threads {
+            if !(1..=1024).contains(&t) {
+                return Err(VanityError::config(
+                    format!(
+                        "threads must be between 1 and 1024, got {t}. \
+                         Leave it undefined to auto-match the CPU's logical core count."
+                    ),
+                    format!(
+                        "threads 必须介于 1 到 1024 之间，当前为 {t}。\
+                         不填则自动按 CPU 逻辑核心数分配。"
+                    ),
+                ));
+            }
+        }
+        let threads = raw.threads;
+
         Ok(Self {
             word_count: raw.word_count as u8,
             front,
@@ -328,6 +389,9 @@ impl Config {
             count: raw.count as u32,
             gpg_key_path,
             gpg_key_inline,
+            threads,
+            derive_batch,
+            output_dir: base_dir.to_path_buf(),
         })
     }
 }
@@ -685,6 +749,64 @@ mod tests {
             let cfg = Config::parse_and_validate(&yaml, &base(), None).unwrap();
             assert_eq!(cfg.count as u64, good);
         }
+    }
+
+    /// derive_batch：默认/边界/非法值/路径要求
+    #[test]
+    fn derive_batch_校验() {
+        let base_yaml = |b: &str| {
+            format!(
+                "word_count: 12\nfront: \"ab\"\ncount: 1\nderive_batch: {b}\n\
+                 gpg_key_file: \"tests/fixtures/fx1024.asc\"\n"
+            )
+        };
+        // 默认未定义 = 1
+        let cfg = Config::parse_and_validate(&base_yaml("x").replace("derive_batch: x\n", ""), &base(), None).unwrap();
+        assert_eq!(cfg.derive_batch, 1);
+        // 合法：1 与 1000
+        for good in ["1", "1000"] {
+            let cfg = Config::parse_and_validate(&base_yaml(good), &base(), None).unwrap();
+            assert_eq!(cfg.derive_batch, good.parse::<u32>().unwrap());
+        }
+        // 非法：0 与 1001
+        for bad in ["0", "1001"] {
+            let err = Config::parse_and_validate(&base_yaml(bad), &base(), None).unwrap_err();
+            assert!(err.en.contains("derive_batch must be between"));
+        }
+    }
+
+    /// threads 自定义线程数：边界与非法值
+    #[test]
+    fn threads_边界与非法值() {
+        // 合法边界：1 与 1024
+        for good in [1u32, 1024] {
+            let yaml = format!(
+                "word_count: 12\nfront: \"ab\"\ncount: 1\nthreads: {good}\n\
+                 gpg_key_file: \"tests/fixtures/fx1024.asc\"\n"
+            );
+            let cfg = Config::parse_and_validate(&yaml, &base(), None).unwrap();
+            assert_eq!(cfg.threads, Some(good));
+        }
+        // 非法：0 与 1025
+        for bad in [0u32, 1025] {
+            let yaml = format!(
+                "word_count: 12\nfront: \"ab\"\ncount: 1\nthreads: {bad}\n\
+                 gpg_key_file: \"tests/fixtures/fx1024.asc\"\n"
+            );
+            let err = Config::parse_and_validate(&yaml, &base(), None).unwrap_err();
+            assert!(
+                err.en.contains("threads must be between 1 and 1024"),
+                "应包含英文错误说明：{}",
+                err.en
+            );
+        }
+        // 未定义：默认 None（自动分配）
+        let yaml = String::from(
+            "word_count: 12\nfront: \"ab\"\ncount: 1\n\
+             gpg_key_file: \"tests/fixtures/fx1024.asc\"\n",
+        );
+        let cfg = Config::parse_and_validate(&yaml, &base(), None).unwrap();
+        assert_eq!(cfg.threads, None);
     }
 
     #[test]

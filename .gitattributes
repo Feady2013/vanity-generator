@@ -1,0 +1,6 @@
+# 防止 git 在 Windows 上做换行符转换（autocrlf）：
+# vendor/ 内是 cargo 锁定 checksum 的源码，任何字节改动都会导致
+# cargo 校验失败（fork 上 Windows 构建失败的真实根因）。
+vendor/** -text
+# 锁文件与二进制同样保持原样
+*.lock -text

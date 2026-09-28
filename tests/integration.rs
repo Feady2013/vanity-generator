@@ -58,11 +58,10 @@ fn 确定性_rng_10000次可重现() {
         for _ in 0..10_000 {
             let mut entropy = [0u8; 16];
             rng.fill_bytes(&mut entropy);
-            let hit = g
+            let (hits, _) = g
                 .derive_and_match(&entropy, &matcher)
-                .unwrap()
-                .expect("全条件匹配器必然命中");
-            out.push(hit.address);
+                .unwrap();
+            out.push(hits[0].address.clone());
         }
         out
     };
@@ -85,7 +84,8 @@ fn 两字符前缀_10000次内命中() {
         let mut entropy = [0u8; 16];
         rng.fill_bytes(&mut entropy);
         attempts += 1;
-        if let Some(hit) = g.derive_and_match(&entropy, &matcher).unwrap() {
+        let (hits, _) = g.derive_and_match(&entropy, &matcher).unwrap();
+        if let Some(hit) = hits.first() {
             let lower = hit.address[2..].to_ascii_lowercase();
             assert!(lower.starts_with("ab"));
             break;

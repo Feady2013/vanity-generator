@@ -31,7 +31,6 @@ sequoia-openpgp = { version = "=1.21.2", default-features = false, features = ["
 bip32 = { version = "=0.5.3", default-features = false, features = ["secp256k1", "std"] }
 
 # ===== 并行与性能 =====
-rayon = "=1.10.0"
 memchr = "=2.7.6"
 crossbeam-channel = "=0.5.17"
 

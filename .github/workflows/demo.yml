@@ -199,9 +199,16 @@ jobs:
           BIN=$!
           uploaded=""
           killed=0
+          prev_line=""
           start=$SECONDS
           while kill -0 "$BIN" 2>/dev/null; do
             upload_new_hits
+            # 进度行实时透传到 Actions 控制台（仅内容变化时打印，避免刷屏）
+            last_line=$(tail -n 1 run.log 2>/dev/null || true)
+            if [ -n "$last_line" ] && [ "$last_line" != "$prev_line" ]; then
+              echo "[进度] $last_line"
+              prev_line="$last_line"
+            fi
             G=$(hits_on_release)
             if [ "$G" -ge "$TARGET" ]; then
               echo "共同目标达成（全局 $G/$TARGET），本机提前停止"
@@ -230,8 +237,8 @@ jobs:
           upload_new_hits || true
           cp run.log "/tmp/out/log-machine-${M}.log"
           gh release upload demo-latest "/tmp/out/log-machine-${M}.log" --clobber || true
-          echo "===== 本机运行日志（尾部） ====="
-          tail -n 8 run.log
+          echo "===== 本机完整运行日志 ====="
+          cat run.log
 
       - name: 构建产物检查（防路径遗漏）
         if: always()

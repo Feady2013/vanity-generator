@@ -57,6 +57,37 @@ GnuPG 的机器上解密：`gpg --decrypt vanity_xxx.asc > wallet.txt`。
 只想验证配置而不开始搜索：`./vanity-generator --check`，会输出规则难度预估
 （期望尝试次数与参考耗时），难度过高会直接提示。
 
+可选性能配置（config.yaml）：
+
+- `threads: N`（1..=1024）：自定义工作线程数；不填则自动按 **CPU 逻辑核心数**
+  分配（含超线程，4 核 8 线程 → 8）
+- `derive_batch: N`（默认 1）：**批派生提速**——一个助记词派生
+  `m/44'/60'/0'/0/0..N-1` 共 N 个地址参与匹配（MetaMask 多账户同款设计），
+  单机吞吐约提升 N×0.7 倍（实测 N=8：433/s → 2457/s，5.7×）。
+  熵强度不变（详见 docs/security-audit.md 第三节）；注意：批派生的多个地址
+  共享同一助记词，**备份助记词 = 备份全部 N 个地址**（导入 MetaMask
+  对应账户即可恢复）。
+
+## Docker 部署
+
+```bash
+# 1. 准备 ./config 目录：config.yaml（gpg_key_file 填 /config/gpg.asc 绝对路径）+ gpg.asc
+# 2. 一键启动（限 2 核 / 512MB、禁用网络、命中 count 个地址后自动退出停止）：
+docker compose up -d
+# 命中的加密文件（vanity_*.asc）会出现在 ./config/ 目录
+```
+
+或直接拉取镜像（CI 自动构建并发布）：
+
+```bash
+docker pull ghcr.io/sweetsky123/vanity-generator:latest
+docker run --rm --network none -v ./config:/config \
+  ghcr.io/sweetsky123/vanity-generator --config /config/config.yaml
+```
+
+镜像为 scratch 静态二进制（约 3.4MB），构建使用 vendor 内置依赖（零网络下载，
+中国大陆机器友好）。
+
 ## CI 多机并行演示
 
 仓库自带手动触发的多机并行工作流（Actions → 靓号演示（多机并行·共同目标）→ Run workflow）：
@@ -90,7 +121,10 @@ GnuPG 的机器上解密：`gpg --decrypt vanity_xxx.asc > wallet.txt`。
   把文件内容整个放进 `gpg` Secret 或与二进制同目录。
 - **Windows**：解压 zip 后，把 config.example.yaml 改名为 config.yaml，
   与 vanity-generator.exe 放同一目录再运行（或在 PowerShell 里 `.\vanity-generator.exe --check` 验证）。
-- **进度行没有出现**：确认 config 里 `progress_every` 为正整数（如 1000），`false` 为关闭。
+- **进度行没有出现**：两种常见原因——①总尝试数低于阈值（如规则期望 4096 次
+  而 progress_every: 100000，全程不会触发任何一行，启动日志与结束提示会
+  说明预计行数；演示短任务建议 5000）②确认 `progress_every` 为正整数、
+  `false` 为关闭。
 
 ## 工作原理
 

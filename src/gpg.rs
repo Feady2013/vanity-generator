@@ -216,8 +216,9 @@ mod tests {
         let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &[0x8000_002C, 0x8000_003C, 0x8000_0000, 0, 0], false)
             .unwrap();
         let m = crate::matcher::Matcher::new(false, None, None, None);
-        let hit = g.derive_and_match(&[0u8; 32], &m).unwrap().unwrap();
-        let text = build_plaintext(&hit);
+        let (hits, _) = g.derive_and_match(&[0u8; 32], &m).unwrap();
+        let hit = &hits[0];
+        let text = build_plaintext(hit);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines.len(), 4);
         assert!(lines[0].starts_with("Address: 0x"));

@@ -50,8 +50,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-          mkdir -p .cargo
-          printf '[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
+          # 幂等追加：vendor 提交的 .cargo/config.toml 已含该段，
+          # 无条件重复追加会造成 TOML 重复键解析失败（fork 上实测踩坑）
+          if ! grep -q 'aarch64-unknown-linux-musl' .cargo/config.toml 2>/dev/null; then
+            printf '\n[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
+          fi
 
 
       - name: 缓存依赖

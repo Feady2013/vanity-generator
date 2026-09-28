@@ -1,7 +1,7 @@
-//! main.rs —— 入口：参数解析 + 配置加载 + rayon 并行调度 + GPG 加密落盘
+//! main.rs —— 入口：参数解析 + 配置加载 + std::thread 并行调度 + GPG 加密落盘
 //!
 //! 并行模型（规格 performance_optimization）：
-//! - `rayon::scope` 派生 N 个 worker（N = available_parallelism，默认全速）；
+//! - `std::thread::scope` 派生 N 个 worker（N = config 或 available_parallelism）；
 //! - worker 各自持有独立的 [`Generator`]（无锁竞争），循环"生成-检查"；
 //! - 每次尝试通过 `AtomicU64` 领取全局序号，据此输出进度通知（取模判断，
 //!   u64 语义下无溢出风险）；
@@ -16,11 +16,9 @@ use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Instant;
-
 use anyhow::Result;
 use clap::Parser;
 use crossbeam_channel::unbounded;
-use rayon::scope;
 
 use vanity_generator::config::Config;
 use vanity_generator::error::VanityError;
@@ -88,8 +86,12 @@ fn run() -> Result<()> {
     };
     let encryptor = GpgEncryptor::from_bytes(&gpg_data)?;
 
-    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
-    print_startup(&cfg, &matcher, &encryptor, threads, &exe_dir);
+    // 工作线程数：config 指定优先；否则按 CPU 逻辑核心数自动分配
+    // （available_parallelism 返回逻辑 CPU 数，即含超线程：4 核 8 线程 → 8）
+    let threads = cfg
+        .threads
+        .map_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get()), |n| n as usize);
+    print_startup(&cfg, &matcher, &encryptor, threads, &cfg.output_dir);
 
     // --check：校验通过即退出（不开始搜索）
     if cli.check {
@@ -108,10 +110,12 @@ fn run() -> Result<()> {
     let seq = AtomicU32::new(0);
     let encrypt_err: Mutex<Option<VanityError>> = Mutex::new(None);
 
-    // 直接使用 rayon 全局池（默认 = available_parallelism 线程）：
-    // scope 闭包在本线程执行收包循环，N 个 worker 全部进入池内并行。
-    // 不自建 ThreadPool：自建池若把闭包 install 到池内线程，
-    // 会占掉一个 worker 槽位导致实际并行度少 1（已实测踩坑）。
+    // 调度架构：std::thread::scope 派生 N 个原生 OS 线程（非工作窃取池）。
+    // 理由：本负载是 N 个粗粒度独立搜索循环，无细粒度可窃取任务，
+    // rayon 的池注入/睡眠唤醒协议在单线程池下存在丢唤醒竞态
+    // （rayon-core sleep/mod.rs 注释自认"特定竞态下可能无法唤醒"），
+    // 实测 num_threads(1) 时注入任务永不执行 → 1 核机器死锁。
+    // 原生 scope 线程语义确定：N 个 worker + 主线程收包，任意 N ≥ 1 均安全。
     {
         // 预先借用/复制跨线程共享的数据（避免 move 闭包逐值搬移）
         let matcher = &matcher;
@@ -119,8 +123,9 @@ fn run() -> Result<()> {
         let cfg_indices = &cfg.path_indices;
         let cfg_wc = cfg.word_count;
         let cfg_cs = cfg.case_sensitive;
+        let cfg_batch = cfg.derive_batch;
         let cfg_every = cfg.progress_every;
-        scope(|s| {
+        std::thread::scope(|s| {
             for _ in 0..threads {
                 let tx = tx.clone();
                 let stopped = &stopped;
@@ -128,10 +133,10 @@ fn run() -> Result<()> {
                 let attempts = &attempts;
                 let hits = &hits;
                 let progress_lock = &progress_lock;
-                s.spawn(move |_| {
+                s.spawn(move || {
                     // 每个 worker 独立持有生成器上下文（无锁竞争）
                     let mut gen = match Generator::new(cfg_wc, cfg_path, cfg_indices, cfg_cs) {
-                        Ok(g) => g,
+                        Ok(g) => g.with_derive_batch(cfg_batch),
                         Err(e) => {
                             eprintln!("{e}");
                             failed.store(true, Ordering::Relaxed);
@@ -143,10 +148,23 @@ fn run() -> Result<()> {
                         if stopped.load(Ordering::Relaxed) {
                             return;
                         }
+                        // 一次"生成-检查"：checked = 本次检查的地址数
+                        // （derive_batch > 1 时一个助记词派生多个地址，一次领取）
+                        let (hit_vec, checked) = match gen.try_once(matcher) {
+                            Ok(r) => r,
+                            Err(e) => {
+                                eprintln!("{e}");
+                                failed.store(true, Ordering::Relaxed);
+                                stopped.store(true, Ordering::Relaxed);
+                                return;
+                            }
+                        };
                         // 全局尝试序号：u64 取模判断进度，无溢出风险
-                        let ticket = attempts.fetch_add(1, Ordering::Relaxed) + 1;
+                        let before = attempts.fetch_add(checked as u64, Ordering::Relaxed);
+                        let ticket = before + checked as u64;
                         if let Some(every) = cfg_every {
-                            if ticket % every == 0 {
+                            // 批量跨过阈值边界时输出进度行（batch 可能一次跨多级）
+                            if ticket / every > before / every {
                                 let _guard = progress_lock.lock().unwrap_or_else(|p| p.into_inner());
                                 let elapsed = started.elapsed().as_secs_f64();
                                 println!(
@@ -158,18 +176,9 @@ fn run() -> Result<()> {
                                 );
                             }
                         }
-                        match gen.try_once(matcher) {
-                            Ok(Some(hit)) => {
-                                if tx.send(hit).is_err() {
-                                    // 主线程已退出（异常终止），停止工作
-                                    return;
-                                }
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                eprintln!("{e}");
-                                failed.store(true, Ordering::Relaxed);
-                                stopped.store(true, Ordering::Relaxed);
+                        for hit in hit_vec {
+                            if tx.send(hit).is_err() {
+                                // 主线程已退出（异常终止），停止工作
                                 return;
                             }
                         }
@@ -182,7 +191,7 @@ fn run() -> Result<()> {
             let mut encrypted_files: Vec<PathBuf> = Vec::new();
             for hit in rx {
                 let n = seq.fetch_add(1, Ordering::Relaxed) + 1;
-                match encryptor.encrypt_to_file(&hit, &exe_dir, n) {
+                match encryptor.encrypt_to_file(&hit, &cfg.output_dir, n) {
                     Ok(path) => {
                         hits.store(n, Ordering::Relaxed);
                         encrypted_files.push(path.clone());
@@ -229,8 +238,17 @@ fn run() -> Result<()> {
         hit_n,
         elapsed,
         total as f64 / elapsed.max(f64::EPSILON),
-        exe_dir.display()
+        cfg.output_dir.display()
     );
+    // 进度提示：阈值高于总尝试数时用户会疑惑"为何没有进度行"，显式解释
+    if let Some(every) = cfg.progress_every {
+        if total < every {
+            println!(
+                "提示       : 本次总尝试数 {total} 低于 progress_every 阈值 {every}，\
+                 故未输出任何进度行；短任务建议调低阈值（如 5000）。"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -254,7 +272,7 @@ fn print_startup(
     matcher: &Matcher,
     encryptor: &GpgEncryptor,
     threads: usize,
-    exe_dir: &std::path::Path,
+    output_dir: &std::path::Path,
 ) {
     let entropy_bits = match cfg.word_count {
         12 => 128,
@@ -292,10 +310,22 @@ fn print_startup(
             .count()
     );
     println!("目标数量   : {}", cfg.count);
+    if cfg.derive_batch > 1 {
+        println!(
+            "批派生     : 每助记词派生 {} 个地址（末层连续索引，约 {}× 提速）",
+            cfg.derive_batch, cfg.derive_batch
+        );
+    }
     println!(
         "进度通知   : {}",
-        cfg.progress_every
-            .map_or_else(|| "已禁用".to_string(), |n| format!("每 {n} 次尝试"))
+        cfg.progress_every.map_or_else(
+            || "已禁用".to_string(),
+            |n| {
+                // 按当前规则难度预估进度行数量，帮助用户设置合理阈值
+                let est_lines = (expected / n as f64).ceil();
+                format!("每 {n} 次尝试（按本规则难度预计输出约 {est_lines:.0} 行）")
+            }
+        )
     );
     let key_src = cfg
         .gpg_key_path
@@ -309,8 +339,13 @@ fn print_startup(
         key_src,
         encryptor.usable_keys()
     );
-    println!("工作线程   : {threads}");
-    println!("输出目录   : {}", exe_dir.display());
+    match cfg.threads {
+        Some(n) => println!("工作线程   : {n}（config.yaml 指定）"),
+        None => println!(
+            "工作线程   : {threads}（自动 = CPU 逻辑核心数，含超线程）"
+        ),
+    }
+    println!("输出目录   : {}", output_dir.display());
 }
 
 /// 人类可读的大数字（256 / 6.6万 / 43亿 / 1.2e15）
