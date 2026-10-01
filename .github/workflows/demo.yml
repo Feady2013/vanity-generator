@@ -107,7 +107,9 @@ jobs:
     name: 搜索 (${{ matrix.machine }}/${{ needs.setup.outputs.machines }})
     needs: setup
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '15') + 10 }}
+    # 任务级硬超时（分钟）：搜索时限 ≤20 + 下载/上报余量（GitHub 表达式
+    # 不支持算术，取保守上界；循环内的精确时限以 TM 为准）
+    timeout-minutes: 40
     strategy:
       fail-fast: false
       matrix:
