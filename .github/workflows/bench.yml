@@ -51,7 +51,8 @@ jobs:
           CUR1=$(grep -a "进度" /tmp/cur-single.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
           export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 20000\nthreads: 1\nderive_batch: 8\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
           timeout 22 ./vanity-generator > /tmp/cur-batch.log 2>&1 || true
-          CUR8=$(grep -a "进度" /tmp/cur-batch.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          CUR8=$(grep -a "进度" /tmp/cur-batch.log | tail -1 | grep -oE "(速率|平均) [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          [ "$CUR8" = "0" ] && { echo "批派生测量失败，日志尾部："; tail -5 /tmp/cur-batch.log; }
           echo "当前单路径: ${CUR1}/s；当前批派生(8): ${CUR8}/s"
           echo "CUR1=$CUR1" >> "$GITHUB_ENV"
           echo "CUR8=$CUR8" >> "$GITHUB_ENV"
@@ -65,7 +66,8 @@ jobs:
           cd /tmp/base/target/release && cp /tmp/bench.asc .
           export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\nthreads: 1\ngpg_key_file: "/tmp/base/target/release/bench.asc"\n')"
           timeout 22 ./vanity-generator > /tmp/base-single.log 2>&1 || true
-          BASE1=$(grep -a "进度" /tmp/base-single.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          BASE1=$(grep -a "进度" /tmp/base-single.log | tail -1 | grep -oE "(速率|平均) [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          [ "$BASE1" = "0" ] && { echo "基线测量失败，日志尾部："; tail -5 /tmp/base-single.log; }
           echo "基线单路径: ${BASE1}/s"
           echo "BASE1=$BASE1" >> "$GITHUB_ENV"
 

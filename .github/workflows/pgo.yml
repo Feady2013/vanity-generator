@@ -1,0 +1,124 @@
+name: PGO 性能对比（实机）
+
+# 手动触发的 PGO（Profile-Guided Optimization）实机对比：
+# 1. 普通构建 → 测基准速率（单路径 + 批派生）
+# 2. 插桩构建（-Cprofile-generate）
+# 3. 单机训练约 5 分钟：真实搜索负载（注意：用"自然退出的短运行循环"
+#    而非 timeout 强杀——LLVM 插桩数据仅在进程正常退出时落盘）
+# 4. profdata 合并 → -Cprofile-use 重建
+# 5. 同一 runner 上测量 PGO 版速率，输出对比表
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  pgo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Rust 工具链 + llvm-tools（llvm-profdata）
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 生成测试 GPG 公钥
+        run: |
+          gpg --batch --passphrase '' --quick-generate-key "pgo-test-key" default default never 2>/dev/null || true
+          gpg --export --armor "pgo-test-key" > /tmp/bench.asc
+
+      - name: 普通构建并测基准
+        run: |
+          cargo build --release --offline
+          cp /tmp/bench.asc target/release/
+          cd target/release
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\nthreads: 1\ngpg_key_file: "bench.asc"\n')"
+          timeout 22 ./vanity-generator > /tmp/plain-single.log 2>&1 || true
+          PLAIN1=$(grep -a "进度" /tmp/plain-single.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 20000\nthreads: 1\nderive_batch: 8\ngpg_key_file: "bench.asc"\n')"
+          timeout 22 ./vanity-generator > /tmp/plain-batch.log 2>&1 || true
+          PLAIN8=$(grep -a "进度" /tmp/plain-batch.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          [ "$PLAIN1" = "0" ] && { echo "基准单路径测量失败，日志尾部："; tail -5 /tmp/plain-single.log; }
+          [ "$PLAIN8" = "0" ] && { echo "基准批派生测量失败，日志尾部："; tail -5 /tmp/plain-batch.log; }
+          echo "普通构建：单路径 ${PLAIN1}/s，批派生(8) ${PLAIN8}/s"
+          echo "PLAIN1=$PLAIN1" >> "$GITHUB_ENV"
+          echo "PLAIN8=$PLAIN8" >> "$GITHUB_ENV"
+
+      - name: 插桩构建（-Cprofile-generate）
+        run: |
+          mkdir -p /tmp/pgodata
+          RUSTFLAGS="-Cprofile-generate=/tmp/pgodata" cargo build --release --offline
+
+      - name: 训练约 5 分钟（单机真实负载，自然退出循环）
+        run: |
+          cd target/release
+          # 训练 A：单路径热循环 ~150 秒。
+          # 每次 count:3 自然退出（LLVM 插桩数据仅在正常退出时落盘，
+          # timeout 强杀会丢失 profile），循环至时间预算用尽
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ff"\ncount: 3\nprogress_every: false\ngpg_key_file: "bench.asc"\n')"
+          end=$((SECONDS + 150)); n=0
+          while [ $SECONDS -lt $end ]; do
+            LLVM_PROFILE_FILE=/tmp/pgodata/single_%p.profraw ./vanity-generator > /dev/null 2>&1 || true
+            n=$((n+1))
+          done
+          echo "训练 A（单路径）：${n} 轮自然退出"
+          # 训练 B：批派生热循环 ~150 秒
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "fff"\ncount: 3\nprogress_every: false\nderive_batch: 8\ngpg_key_file: "bench.asc"\n')"
+          end=$((SECONDS + 150)); n=0
+          while [ $SECONDS -lt $end ]; do
+            LLVM_PROFILE_FILE=/tmp/pgodata/batch_%p.profraw ./vanity-generator > /dev/null 2>&1 || true
+            n=$((n+1))
+          done
+          echo "训练 B（批派生）：${n} 轮自然退出"
+          ls /tmp/pgodata/ | wc -l | xargs echo "profraw 文件数："
+
+      - name: 合并 profile 数据
+        run: |
+          PROFDATA=$(find "$HOME/.rustup" -name llvm-profdata -path "*x86_64*" | head -1)
+          [ -z "$PROFDATA" ] && { echo "未找到 llvm-profdata"; exit 1; }
+          "$PROFDATA" merge -sparse /tmp/pgodata/*.profraw -o /tmp/vanity.profdata
+          ls -la /tmp/vanity.profdata
+
+      - name: PGO 重建（-Cprofile-use）
+        run: |
+          RUSTFLAGS="-Cprofile-use=/tmp/vanity.profdata" cargo build --release --offline
+
+      - name: 测量 PGO 版本（同窗口同规则）
+        run: |
+          cp /tmp/bench.asc target/release/
+          cd target/release
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\nthreads: 1\ngpg_key_file: "bench.asc"\n')"
+          timeout 22 ./vanity-generator > /tmp/pgo-single.log 2>&1 || true
+          PGO1=$(grep -a "进度" /tmp/pgo-single.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 20000\nthreads: 1\nderive_batch: 8\ngpg_key_file: "bench.asc"\n')"
+          timeout 22 ./vanity-generator > /tmp/pgo-batch.log 2>&1 || true
+          PGO8=$(grep -a "进度" /tmp/pgo-batch.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          [ "$PGO1" = "0" ] && { echo "PGO 单路径测量失败，日志尾部："; tail -5 /tmp/pgo-single.log; }
+          [ "$PGO8" = "0" ] && { echo "PGO 批派生测量失败，日志尾部："; tail -5 /tmp/pgo-batch.log; }
+          echo "PGO1=$PGO1" >> "$GITHUB_ENV"
+          echo "PGO8=$PGO8" >> "$GITHUB_ENV"
+
+      - name: 输出对比结论
+        run: |
+          echo "===== PGO 实机对比（同一 runner，单线程 22s 窗口，规则 ffff）====="
+          echo "             单路径      批派生(8)"
+          echo "普通构建   : ${PLAIN1}/s      ${PLAIN8}/s"
+          echo "PGO 构建   : ${PGO1}/s      ${PGO8}/s"
+          if [ "${PLAIN1}" -gt 0 ] && [ "${PGO1}" -gt 0 ]; then
+            python3 -c "
+            p1, g1, p8, g8 = ${PLAIN1}, ${PGO1}, ${PLAIN8}, ${PGO8}
+            print(f'单路径 PGO 增益：{(g1/p1-1)*100:+.1f}%')
+            if p8 > 0 and g8 > 0:
+                print(f'批派生(8) PGO 增益：{(g8/p8-1)*100:+.1f}%')
+            print('解读：±3% 以内属 runner 噪声；≥2% 才值得在生产采用（README「生产环境 PGO」）')
+            "
+          fi

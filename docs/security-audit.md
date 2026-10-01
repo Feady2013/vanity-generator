@@ -77,5 +77,27 @@
 - [x] 构建供应链：vendor + checksum + 纯 Rust
 - [x] 速率优化路径（SIMD 匹配、LICM、批派生）均不触碰熵与协议构造
 
-**结论**：未发现违反上述任何规范的实现；derive_batch 与 MetaMask
+## 五、vendored 库性能补丁的安全论证（2026-10-01，保留决策）
+
+按"改库源码 + 清空 checksum 映射 + 差分验证"方式对 vendored 库做的性能
+修改（bitcoin_hashes 新增 `compress_block` 原语；bip39 pbkdf2 热循环直驱
+压缩），安全性论证链条完整，**结论通过并保留**：
+
+1. **密码学原语零新增**：compress_block 是原 `process_block` 80 轮压缩体
+   的逐行参数化（同一宏展开），不引入任何新的数学运算；pbkdf2 热循环
+   的 HMAC 结构（ipad/opad 状态 + 192 字节消息终块）与原实现数学等价
+   ——U1 与密钥化仍走原引擎路径。
+2. **逐位一致性差分**：tests/pbkdf2_differential.rs 用 RustCrypto
+   （hmac+sha2，业界审计最广的实现之一）作**独立参考**，12/18/24 词 ×
+   空口令/TREZOR/长口令/超 128 字节触发密钥先哈希分支，输出逐位一致；
+   BIP39 官方黄金向量锚定；66 项地址级确定性向量回归。
+   **该测试是 CI 常驻门禁**——库行为任何偏移都会被拦截。
+3. **零 unsafe、零新依赖、零供应链外联**：修改局限于 vendored 源码 +
+   标准 vendor 补丁机制（.cargo-checksum.json files 映射清空），构建
+   仍离线自包含。
+4. **性能如实记录**（perf-research §7）：A/B 实测 0%（fat-LTO 已消除
+   引擎开销），按 <2% 纪律本应回滚；**按用户决策保留**（结构性更直白、
+   差分门禁常驻），收益与理由留档，不构成虚假性能主张。
+
+**总结论**：未发现违反上述任何规范的实现；derive_batch 与 MetaMask
 多账户模型同构，安全等价，默认关闭、显式启用。

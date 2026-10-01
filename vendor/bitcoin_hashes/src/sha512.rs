@@ -236,20 +236,31 @@ impl HashEngine {
     // Algorithm copied from libsecp256k1
     fn process_block(&mut self) {
         debug_assert_eq!(self.buffer.len(), BLOCK_SIZE);
+        let block = self.buffer;
+        compress_block(&mut self.h, &block);
+    }
+}
 
-        let mut w = [0u64; 16];
-        for (w_val, buff_bytes) in w.iter_mut().zip(self.buffer.chunks(8)) {
-            *w_val = util::slice_to_u64_be(buff_bytes);
-        }
+/// 压缩单个 128 字节块并更新状态。
+///
+/// 本仓库性能补丁（语义不变）：新增公共原语，供 PBKDF2 等固定块模式的
+/// 热循环直接驱动压缩函数。与 `engine.input(block)` 后继续 finalize 的
+/// 状态推进在数学上等价（NIST 向量 + 差分测试锚定，见
+/// tests/pbkdf2_differential.rs）。
+pub fn compress_block(state: &mut [u64; 8], block: &[u8; BLOCK_SIZE]) {
+    let mut w = [0u64; 16];
+    for (w_val, buff_bytes) in w.iter_mut().zip(block.chunks(8)) {
+        *w_val = util::slice_to_u64_be(buff_bytes);
+    }
 
-        let mut a = self.h[0];
-        let mut b = self.h[1];
-        let mut c = self.h[2];
-        let mut d = self.h[3];
-        let mut e = self.h[4];
-        let mut f = self.h[5];
-        let mut g = self.h[6];
-        let mut h = self.h[7];
+    let mut a = state[0];
+    let mut b = state[1];
+    let mut c = state[2];
+    let mut d = state[3];
+    let mut e = state[4];
+    let mut f = state[5];
+    let mut g = state[6];
+    let mut h = state[7];
 
         round!(a, b, c, d, e, f, g, h, 0x428a2f98d728ae22, w[0]);
         round!(h, a, b, c, d, e, f, g, 0x7137449123ef65cd, w[1]);
@@ -336,15 +347,14 @@ impl HashEngine {
         round!(c, d, e, f, g, h, a, b, 0x5fcb6fab3ad6faec, w[14], w[12], w[7], w[15]);
         round!(b, c, d, e, f, g, h, a, 0x6c44198c4a475817, w[15], w[13], w[8], w[0]);
 
-        self.h[0] = self.h[0].wrapping_add(a);
-        self.h[1] = self.h[1].wrapping_add(b);
-        self.h[2] = self.h[2].wrapping_add(c);
-        self.h[3] = self.h[3].wrapping_add(d);
-        self.h[4] = self.h[4].wrapping_add(e);
-        self.h[5] = self.h[5].wrapping_add(f);
-        self.h[6] = self.h[6].wrapping_add(g);
-        self.h[7] = self.h[7].wrapping_add(h);
-    }
+    state[0] = state[0].wrapping_add(a);
+    state[1] = state[1].wrapping_add(b);
+    state[2] = state[2].wrapping_add(c);
+    state[3] = state[3].wrapping_add(d);
+    state[4] = state[4].wrapping_add(e);
+    state[5] = state[5].wrapping_add(f);
+    state[6] = state[6].wrapping_add(g);
+    state[7] = state[7].wrapping_add(h);
 }
 
 #[cfg(test)]

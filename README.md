@@ -68,6 +68,40 @@ GnuPG 的机器上解密：`gpg --decrypt vanity_xxx.asc > wallet.txt`。
   共享同一助记词，**备份助记词 = 备份全部 N 个地址**（导入 MetaMask
   对应账户即可恢复）。
 
+
+## 生产环境 PGO（按本机负载定制二进制）
+
+编译器默认按"通用分支概率"优化；PGO 用真实运行统计纠正它，对分支密集的
+密码学热路径通常有可测增益（本项目 CI 实测数字见 Actions 的
+「PGO 性能对比」工作流）。三步：
+
+```bash
+# ① 插桩构建（计数器会随运行累积）
+RUSTFLAGS="-Cprofile-generate=/tmp/pgodata" cargo build --release --offline
+
+# ② 训练：用你真实的搜索负载跑几分钟（规则/线程数与生产一致；
+#    进程必须自然退出——插桩数据只在退出时落盘，别用 kill）
+mkdir -p /tmp/pgodata
+export VANITY_CONFIG="$(cat config.yaml)"   # 你自己的配置
+./target/release/vanity-generator &         # 跑到命中 count 自然结束
+
+# ③ 合并 profile 并重建（llvm-profdata 由 rustup 组件提供）
+rustup component add llvm-tools-preview
+PROFDATA=$(find ~/.rustup -name llvm-profdata | head -1)
+"$PROFDATA" merge -sparse /tmp/pgodata/*.profraw -o /tmp/vanity.profdata
+RUSTFLAGS="-Cprofile-use=/tmp/vanity.profdata" cargo build --release --offline
+```
+
+要点：
+
+- 训练负载要**代表生产**（同样的规则难度与 derive_batch 设置），否则
+  profile 会误导优化器
+- 多台不同 CPU 的机器请分别训练（profile 反映的是指令缓存/分支行为，
+  跨机复用收益会打折）
+- 重建产物与普通构建**行为完全一致**（PGO 只改变代码布局与分支预测
+  提示，不改变语义）——用 `cargo test --release` 复核后即可替换部署
+- 收益门槛：±3% 以内多为噪声，≥2% 才值得维护 profile 文件
+
 ## Docker 部署
 
 ```bash
