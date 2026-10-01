@@ -44,6 +44,9 @@ zeroize = { version = "=1.8.2", features = ["derive"] }
 hex = "=0.4.3"
 
 [dev-dependencies]
+# 差分测试用独立参考实现（版本与 Cargo.lock/vendor 锚定一致）
+hmac = "=0.12.1"
+sha2 = "=0.10.9"
 criterion = { version = "=0.5.1", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]

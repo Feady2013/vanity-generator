@@ -1,0 +1,85 @@
+name: 性能 A/B 对比（实机）
+
+# 手动触发的实机性能对比（同一 runner 硬件上 A/B，消除跨机噪声）：
+# - 基线（BASE_SHA，默认 e9e24f0 = derive_batch 之前）vs 当前 HEAD
+# - 各测单线程 15 秒窗口速率；当前版本额外测 derive_batch=8
+# - 输出对比表与结论（引入/回滚决策依据，A/B < 2% 视为无差异）
+on:
+  workflow_dispatch:
+    inputs:
+      base_sha:
+        description: 基线提交（默认 derive_batch 之前的 e9e24f0）
+        required: false
+        default: "e9e24f0"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 构建并测试当前版本
+        run: |
+          cargo build --release --offline
+          mkdir -p /tmp/cur && cp target/release/vanity-generator /tmp/cur/
+          GPG_KEY_PLACEHOLDER=1
+
+      - name: 生成演示 GPG 公钥（固定测试密钥）
+        run: |
+          gpg --batch --passphrase '' --quick-generate-key "bench-test-key" default default never 2>/dev/null || true
+          gpg --export --armor "bench-test-key" > /tmp/bench.asc
+
+      - name: 基准当前（单路径 + 批派生）
+        run: |
+          cd /tmp/cur && cp /tmp/bench.asc .
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\nthreads: 1\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
+          timeout 22 ./vanity-generator > /tmp/cur-single.log 2>&1 || true
+          CUR1=$(grep -a "进度" /tmp/cur-single.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 20000\nthreads: 1\nderive_batch: 8\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
+          timeout 22 ./vanity-generator > /tmp/cur-batch.log 2>&1 || true
+          CUR8=$(grep -a "进度" /tmp/cur-batch.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          echo "当前单路径: ${CUR1}/s；当前批派生(8): ${CUR8}/s"
+          echo "CUR1=$CUR1" >> "$GITHUB_ENV"
+          echo "CUR8=$CUR8" >> "$GITHUB_ENV"
+
+      - name: 构建并测试基线版本（BASE_SHA）
+        run: |
+          mkdir -p /tmp/base && git archive ${{ inputs.base_sha || 'e9e24f0' }} | tar -x -C /tmp/base
+          cd /tmp/base
+          # 基线提交无 vendor 缓存，离线优先失败则在线拉取
+          cargo build --release --offline 2>/dev/null || cargo build --release
+          cd /tmp/base/target/release && cp /tmp/bench.asc .
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\nthreads: 1\ngpg_key_file: "/tmp/base/target/release/bench.asc"\n')"
+          timeout 22 ./vanity-generator > /tmp/base-single.log 2>&1 || true
+          BASE1=$(grep -a "进度" /tmp/base-single.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
+          echo "基线单路径: ${BASE1}/s"
+          echo "BASE1=$BASE1" >> "$GITHUB_ENV"
+
+      - name: 输出对比结论
+        run: |
+          echo "===== 实机性能对比（同一 runner，单线程 15s 窗口）====="
+          echo "基线 ${{ inputs.base_sha || 'e9e24f0' }}（derive_batch 之前） 单路径：${BASE1}/s"
+          echo "当前 HEAD                                    单路径：${CUR1}/s"
+          echo "当前 HEAD                                    批派生8：${CUR8}/s"
+          if [ "${BASE1}" -gt 0 ] && [ "${CUR1}" -gt 0 ]; then
+            python3 -c "
+            b, c, c8 = ${BASE1}, ${CUR1}, ${CUR8}
+            print(f'单路径相对基线：{(c/b-1)*100:+.1f}%（±5% 属 runner 噪声，<2% 视为无差异）')
+            if c8 > 0:
+                print(f'批派生(8) 相对单路径：{(c8/c-1)*100:+.1f}%')
+            "
+          fi

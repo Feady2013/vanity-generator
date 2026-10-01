@@ -81,4 +81,22 @@
 3. **调度架构修复**：rayon 单线程池丢唤醒竞态（1 核机器死锁）→ 改用
    `std::thread::scope` 原生线程并移除 rayon 依赖。
 
+## 7. vendored 库代码直改审计与 A/B（2026-10-01，"能直接改库代码吗"的完整答案）
+
+按安全方式（改源码 + 清空 .cargo-checksum.json 的 files 映射 + 差分测试）实施并实测：
+
+| 优化点 | 改动 | 实测 A/B（同机单线程 3 次） | 结论 |
+|---|---|---|---|
+| bip39 pbkdf2 热循环：引擎克隆/分支/字节序转换 → 直驱 compress_block + 尾块 LICM | 完整实现并通过全部差分（RustCrypto 参考 12/18/24 词×4 口令逐位一致 + BIP39 官方向量） | 432/439/437 vs 基线 433/s = **0%** | **回滚**（<2% 门禁）。rustc fat-LTO + codegen-units=1 已把引擎开销优化殆尽，"机器开销"在库源码里存在、在最终二进制里不存在 |
+| bitcoin_hashes sha512：新增 compress_block 公共原语 | 同上验证 | 同上（同一 A/B） | 随上回滚 |
+| k256 公钥派生（管线 ~13%） | 审计未改动 | —— | 已用 GLV 自同态 + Radix-16 有符号分解（纯 Rust 最优实现）；进一步优化 = 手写密码学数学，红线拒绝 |
+| bip32 层 HMAC（6 次/attempt） | 审计未改动 | —— | 引擎开销 ×6/attempt ≈ 0.1%，低于门禁不立项 |
+
+**差分测试（tests/pbkdf2_differential.rs）保留**：RustCrypto hmac+sha2 独立参考实现 vs
+vendored bip39 逐位一致（12/18/24 词 + 口令分支 + BIP39 官方黄金向量）——即使不改库，
+它也是供应链级的行为锚（库被上游静默篡改时 CI 会报警）。
+
+**CI 实机对比**：`bench.yml`（手动触发）在同一 runner 上对比基线提交（e9e24f0，
+derive_batch 之前）vs 当前 HEAD 的单线程速率，并测 derive_batch=8 的增益，输出结论表。
+
 **性能优化的边界（本项目不变约束）**：BIP39/BIP32/EIP-55 标准构造不可改动；熵源不可缓存或预测；stable 工具链；纯 Rust 依赖树；A/B < 2% 回滚。

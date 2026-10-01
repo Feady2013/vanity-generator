@@ -1,22 +1,16 @@
 name: 靓号演示（多机并行·共同目标）
 
-# 手动触发的多机并行演示（v3：共同目标机制）：
+# 手动触发的多机并行演示（v5）：
 #
-# - 使用仓库 Secrets 中的 `config`（config.yaml 内容）与 `gpg`（公钥 armor）；
-# - `machines` 输入选择并行机器数（1..20，默认 8）；
-# - 共同目标：以固定的 prerelease Release（demo-latest）资产作为全局命中
-#   计数器。每台机器命中一个地址后立即把加密产物上传到该 Release，
-#   全部机器每 5 秒轮询全局命中数，达到 config 中的目标数量即停止本机
-#   进程（在途的少量超额命中仍会计入并保留）；
-# - 机器按序号错峰启动（8 秒 × 序号）：低难度场景下先启动的机器可先完成
-#   全部目标，后启动的机器直接空转跳过，实现"精确停在目标数量"；
-#   高难度场景下错峰损耗可忽略；
-# - 演示 Release 固定为 prerelease 标记（永不占用 Latest），且只复用
-#   demo-latest 一个标签，不随运行次数堆积标签；
-# - 全部机器结束后统一整理 Release 标题/说明并附各机器运行日志。
-#
-# 说明：跨机器的实时协调无法用 GitHub 原生机制（无跨 job 信号），
-# 本工作流以"Release 资产计数 + 轮询"实现，属原生兼容方案。
+# - 编译前移：setup 任务统一编译并上传二进制工件，matrix 机器直接下载
+#   运行（省去每台 3-5 分钟的重复编译）
+# - 共同目标：以 demo-latest Release 资产为全局命中计数器，每机命中即刻
+#   上报，全部机器轮询全局命中数，达标即停止本机
+# - 全力并行：机器启动即开搜（无错峰），在途超额命中保留（检测延迟
+#   内的自然超产，通常 ≤ 机器数）
+# - API 防挂起：轮询的 gh api 均带 timeout 15s，杜绝网络挂起卡死循环
+# - 零命中不发布：未命中任何地址时删除演示 Release（不发布空产物）
+# - 发布形态：固定 prerelease 标签 demo-latest（不占 Latest、不堆积标签）
 on:
   workflow_dispatch:
     inputs:
@@ -37,11 +31,10 @@ env:
 
 jobs:
   setup:
-    name: 参数准备
+    name: 初始化（配置·编译·矩阵）
     runs-on: ubuntu-latest
     outputs:
       count: ${{ steps.cfg.outputs.count }}
-      stagger: ${{ steps.gen.outputs.stagger }}
       matrix: ${{ steps.gen.outputs.matrix }}
       machines: ${{ steps.gen.outputs.machines }}
     steps:
@@ -73,6 +66,21 @@ jobs:
           echo "目标数量：$COUNT"
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: 缓存依赖
+        uses: Swatinem/rust-cache@v2
+
+      - name: 编译（release，vendor 离线）
+        run: cargo build --release --offline 2>&1 | tail -2
+
+      - name: 上传二进制工件（matrix 免编译）
+        uses: actions/upload-artifact@v4
+        with:
+          name: vanity-binary
+          path: target/release/vanity-generator
+          retention-days: 1
+
       - name: 生成矩阵并初始化演示 Release
         id: gen
         env:
@@ -86,38 +94,7 @@ jobs:
           echo "矩阵：$MATRIX"
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "machines=$N" >> "$GITHUB_OUTPUT"
-          # 自适应错峰（性能无损策略）：
-          # - 目标数 ≥ 2×机器数：错峰 = 0，全部机器零延迟并行（此情形下
-          #   在途超产占比天然 ≤ (N-1)/count，小到可忽略）
-          # - 目标数 < 2×机器数：错峰 = 单机预计完成全量目标时长 ×2.5
-          #   （上限 45s）。此情形总时长本身只有秒级～分钟级，
-          #   后启机器轮询到达标直接跳过 → 总命中精确停在目标数
-          COUNT=${{ needs.setup.outputs.count }}
-          STAGGER=$(ruby -ryaml -e '
-            c = YAML.load_file("config.yaml")
-            count = c["count"].to_i
-            front = (c["front"] || "").to_s.sub(/^0x/i, "")
-            back  = (c["back"]  || "").to_s.sub(/^0x/i, "")
-            mid   = (c["middle"] || "").to_s
-            exp = 16.0 ** (front.size + back.size)
-            letters = (front + mid + back).chars.count { |ch| ch =~ /[a-zA-Z]/ }
-            exp *= 2.0 ** letters if c["case_sensitive"]
-            unless mid.empty?
-              n = mid.size
-              exp *= 16.0 ** n / [(41 - n), 1].max
-            end
-            machines = ARGV[0].to_i
-            if count >= 2 * machines
-              puts 0
-            else
-              # 单机速率保守按 1800 次/秒（4 线程 × 450）
-              s = (count * exp / 1800.0 * 2.5).ceil
-              puts [s, 45].min
-            end
-          ' "$N" 2>/dev/null || true)
-          if ! [ "$STAGGER" -ge 0 ] 2>/dev/null; then STAGGER=8; fi
-          echo "错峰间隔：${STAGGER}s（0 = 全并行）"
-          echo "stagger=$STAGGER" >> "$GITHUB_OUTPUT"
+          # 全力并行：机器启动即开搜（无错峰延迟）
           # 固定单一 prerelease 标签 demo-latest：不存在则创建，存在则清空旧资产（全局计数归零）
           if ! gh release view demo-latest > /dev/null 2>&1; then
             gh release create demo-latest --prerelease --title "靓号演示（多机并行）" --notes "初始化（自动创建）" || true
@@ -125,12 +102,12 @@ jobs:
           for AID in $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" --jq '.assets[].id' 2>/dev/null); do
             gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$AID" || true
           done
-          echo "demo-latest 资产已清空，全局命中计数从 0 开始"
 
   search:
     name: 搜索 (${{ matrix.machine }}/${{ needs.setup.outputs.machines }})
     needs: setup
     runs-on: ubuntu-latest
+    timeout-minutes: ${{ fromJSON(inputs.timeout_minutes || '15') + 10 }}
     strategy:
       fail-fast: false
       matrix:
@@ -139,12 +116,10 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: 缓存依赖
-        uses: Swatinem/rust-cache@v2
-      - name: 编译（release）
-        run: cargo build --release
+      - name: 下载预编译二进制
+        uses: actions/download-artifact@v4
+        with:
+          name: vanity-binary
 
       - name: 搜索（共同目标：达标即停）
         shell: bash
@@ -155,55 +130,48 @@ jobs:
           MACHINE: ${{ matrix.machine }}
         run: |
           set -u
+          chmod +x ./vanity-generator
           M="$MACHINE"
           TARGET="$TARGET"
-          STAGGER=${{ needs.setup.outputs.stagger }}
           TM=${{ inputs.timeout_minutes || '15' }}
-          echo "机器 $M：共同目标 $TARGET 个地址，本机时限 ${TM} 分钟，错峰间隔 ${STAGGER}s"
+          N=${{ needs.setup.outputs.machines }}
+          echo "机器 $M/$N：共同目标 $TARGET 个地址，时限 ${TM} 分钟，全力并行"
           mkdir -p /tmp/out
 
-          # 自适应错峰（性能无损）：目标数 ≥ 2×机器数时错峰为 0（全并行零损耗）；
-          # 目标数较少时按单机预计完成时长错峰，后启机器达标即跳过、精确停在目标数
-          DELAY=$(( (M-1)*STAGGER ))
-          [ "$DELAY" -gt 0 ] && echo "错峰延迟 ${DELAY}s" && sleep "$DELAY"
-
           hits_on_release() {
-            gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
+            timeout 15 gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
               --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo -1
           }
 
-          # 达标即可直接跳过搜索（后启动机器的快速通道）
+          # 时限计时（下载完成即开始）
+          start=$SECONDS
+
+          # 达标即可直接跳过搜索（晚到机器快速通道）
           if [ "$(hits_on_release)" -ge "$TARGET" ]; then
             echo "共同目标已由先启机器完成，本机无需搜索"
             exit 0
           fi
 
-          # gh release upload 不支持 # 重命名：先复制到暂存目录再上传，
-          # 资产名 = 暂存文件名（m<机号>-vanity_*.asc 全局唯一）
           upload_new_hits() {
             for f in vanity_*.asc; do
               [ -f "$f" ] || continue
               case " $uploaded " in *" $f "*) continue ;; esac
               staged="/tmp/out/m${M}-$(basename "$f")"
-              if cp "$f" "$staged" && gh release upload demo-latest "$staged" --clobber; then
+              if cp "$f" "$staged" && timeout 30 gh release upload demo-latest "$staged" --clobber; then
                 uploaded="$uploaded $f"
                 echo "已上报命中：m${M}-$(basename "$f")"
               fi
             done
           }
 
-          # 二进制把命中文件写到其所在目录（exe_dir）；进入该目录运行，
-          # 使 vanity_*.asc 与 run.log 都落在当前工作目录，监听循环直接可见
-          cd target/release
           ./vanity-generator > run.log 2>&1 &
           BIN=$!
           uploaded=""
           killed=0
           prev_line=""
-          start=$SECONDS
           while kill -0 "$BIN" 2>/dev/null; do
             upload_new_hits
-            # 进度行实时透传到 Actions 控制台（仅内容变化时打印，避免刷屏）
+            # 进度行实时透传（仅变化时打印）
             last_line=$(tail -n 1 run.log 2>/dev/null || true)
             if [ -n "$last_line" ] && [ "$last_line" != "$prev_line" ]; then
               echo "[进度] $last_line"
@@ -218,17 +186,15 @@ jobs:
               echo "达到本机时限 ${TM} 分钟，停止（已命中部分仍保留）"
               killed=1; kill "$BIN"; break
             fi
-            # 轮询间隔动态调整：前 60 秒 3s（低难度场景决胜期），之后 8s
-            # （控制 GITHUB_TOKEN API 用量：8 机 15 分钟全程 < 1000 次）
+            # 轮询间隔：前 60 秒 3s 决胜；之后 8s，机器数 >10 时 12s（API 配额友好）
             SLEEP=3
             [ $(( SECONDS - start )) -ge 60 ] && SLEEP=8
+            [ "$N" -gt 10 ] && [ $(( SECONDS - start )) -ge 60 ] && SLEEP=12
             sleep "$SLEEP"
           done
-          # 注意：GitHub 的 bash 默认 -e；被 kill 的进程 wait 返回 143，
-          # 必须用 || 捕获退出码，否则脚本会在这一行直接失败
+          # GitHub 的 bash 默认 -e：被 kill 的进程 wait 返回 143，需 || 捕获
           RC=0
           wait "$BIN" 2>/dev/null || RC=$?
-          # 主动停止（协调/时限）视为正常；异常退出必须显式暴露，避免静默零命中
           if [ "$killed" = 0 ] && [ "$RC" != 0 ]; then
             echo "::error::vanity-generator 异常退出（退出码 $RC），日志尾部："
             tail -n 15 run.log
@@ -236,13 +202,13 @@ jobs:
           fi
           upload_new_hits || true
           cp run.log "/tmp/out/log-machine-${M}.log"
-          gh release upload demo-latest "/tmp/out/log-machine-${M}.log" --clobber || true
+          timeout 30 gh release upload demo-latest "/tmp/out/log-machine-${M}.log" --clobber || true
           echo "===== 本机完整运行日志 ====="
           cat run.log
 
       - name: 构建产物检查（防路径遗漏）
         if: always()
-        run: ls -la target/release/vanity_*.asc 2>/dev/null || echo "（本机无命中文件——可能被共同目标提前停止或未命中）"
+        run: ls -la vanity_*.asc 2>/dev/null || echo "（本机无命中文件——可能被共同目标提前停止或未命中）"
 
   publish:
     name: 整理发布
@@ -253,16 +219,20 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
-      - name: 汇总与整理
+      - name: 汇总与整理（零命中不发布）
         run: |
           TARGET=${{ needs.setup.outputs.count }}
-          STAGGER=${{ needs.setup.outputs.stagger }}
-          HITS=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
+          HITS=$(timeout 15 gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
             --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo -1)
           echo "共同目标：$TARGET；全局命中：$HITS"
+          if [ "$HITS" -lt 1 ]; then
+            echo "::notice::本次运行未命中任何地址——按约定不发布 Release（删除演示 Release 及全部临时资产）。"
+            timeout 30 gh release delete demo-latest --yes || true
+            exit 0
+          fi
           # 下载 1 号机日志提取难度提示（如有）
           EXPECT=""
-          if gh release download demo-latest --pattern 'log-machine-*.log' --dir logs 2>/dev/null; then
+          if timeout 30 gh release download demo-latest --pattern 'log-machine-*.log' --dir logs 2>/dev/null; then
             EXPECT=$(grep -h "期望尝试" logs/log-machine-*.log 2>/dev/null | head -1 || true)
           fi
           echo "规则难度：${EXPECT:-（见各机器日志）}"
@@ -271,9 +241,7 @@ jobs:
           {
             echo "## 靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行"
             echo ""
-            STAG_MODE="全并行零错峰"
-            [ "$STAGGER" -gt 0 ] && STAG_MODE="自适应错峰 ${STAGGER}s/台"
-            echo "- 并行机器：${{ inputs.machines || '8' }} 台（${STAG_MODE}）"
+            echo "- 并行机器：${{ inputs.machines || '8' }} 台（启动即全力并行）"
             echo "- 共同目标：$TARGET 个地址（全部机器达标即停）"
             echo "- 状态：$STATUS"
             echo "- ${EXPECT}"
@@ -281,9 +249,6 @@ jobs:
             echo "- 本 Release 为预发布（prerelease），固定复用 demo-latest 标签，不占用 Latest"
           } > notes.md
           cat notes.md
-          gh release edit demo-latest \
+          timeout 30 gh release edit demo-latest \
             --title "靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行" \
             --notes-file notes.md --prerelease
-          if [ "$HITS" -lt 1 ]; then
-            echo "本次未命中：规则可能过难，参考上方难度提示调整 front/back 或延长时间。"
-          fi

@@ -109,6 +109,10 @@ fn run() -> Result<()> {
     let (tx, rx) = unbounded::<vanity_generator::generator::HitRecord>();
     let seq = AtomicU32::new(0);
     let encrypt_err: Mutex<Option<VanityError>> = Mutex::new(None);
+    // 上次进度通知的（全局序号, 毫秒时刻）：用于瞬时速率，长跑时宿主机
+    // 波动/频率调整能被直接看到，累计均值不再误导（Docker 长跑实测教训）
+    let last_prog_ticket = AtomicU64::new(0);
+    let last_prog_ms = AtomicU64::new(0);
 
     // 调度架构：std::thread::scope 派生 N 个原生 OS 线程（非工作窃取池）。
     // 理由：本负载是 N 个粗粒度独立搜索循环，无细粒度可窃取任务，
@@ -133,6 +137,8 @@ fn run() -> Result<()> {
                 let attempts = &attempts;
                 let hits = &hits;
                 let progress_lock = &progress_lock;
+                let last_t = &last_prog_ticket;
+                let last_ms = &last_prog_ms;
                 s.spawn(move || {
                     // 每个 worker 独立持有生成器上下文（无锁竞争）
                     let mut gen = match Generator::new(cfg_wc, cfg_path, cfg_indices, cfg_cs) {
@@ -167,10 +173,21 @@ fn run() -> Result<()> {
                             if ticket / every > before / every {
                                 let _guard = progress_lock.lock().unwrap_or_else(|p| p.into_inner());
                                 let elapsed = started.elapsed().as_secs_f64();
+                                let now_ms = (elapsed * 1000.0) as u64;
+                                let pt = last_t.load(Ordering::Relaxed);
+                                let pms = last_ms.load(Ordering::Relaxed);
+                                let inst = if now_ms > pms && ticket > pt {
+                                    (ticket - pt) as f64 * 1000.0 / (now_ms - pms) as f64
+                                } else {
+                                    ticket as f64 / elapsed.max(f64::EPSILON)
+                                };
+                                last_t.store(ticket, Ordering::Relaxed);
+                                last_ms.store(now_ms, Ordering::Relaxed);
                                 println!(
-                                    "进度：已尝试 {} | 命中 {} | 速率 {:.0}/s | 耗时 {:.0}s",
+                                    "进度：已尝试 {} | 命中 {} | 瞬时 {:.0}/s | 平均 {:.0}/s | 耗时 {:.0}s",
                                     ticket,
                                     hits.load(Ordering::Relaxed),
+                                    inst,
                                     ticket as f64 / elapsed.max(f64::EPSILON),
                                     elapsed
                                 );
