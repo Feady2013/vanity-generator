@@ -82,8 +82,10 @@ fn create_keyed_engines<M>(mnemonic: M) -> (sha512::HashEngine, sha512::HashEngi
 /// midstate [u8; 64] → 状态字 [u64; 8]（大端）
 fn midstate_to_u64(mid: [u8; 64]) -> [u64; 8] {
 	let mut st = [0u64; 8];
+	let mut tmp = [0u8; 8];
 	for (s, c) in st.iter_mut().zip(mid.chunks(8)) {
-		*s = u64::from_be_bytes(c.try_into().unwrap());
+		tmp.copy_from_slice(c);
+		*s = u64::from_be_bytes(tmp);
 	}
 	st
 }
@@ -128,20 +130,21 @@ pub(crate) fn pbkdf2<M>(mnemonic: M, unprefixed_salt: &[u8], c: usize, res: &mut
 	let si = midstate_to_u64(iengine.midstate());
 	let so = midstate_to_u64(oengine.midstate());
 	// 原引擎仅用于 U1（任意 salt 长度正确）
-	let prf = hmac::HmacEngine::from_inner_engines(iengine, oengine);
+	let prf: hmac::HmacEngine<sha512::Hash> =
+		hmac::HmacEngine::from_inner_engines(iengine, oengine);
 
 	for (i, chunk) in res.chunks_mut(sha512::Hash::LEN).enumerate() {
 		for v in chunk.iter_mut() {
 			*v = 0;
 		}
 
-		let mut salt_u = {
+		let mut salt_u: [u8; 64] = {
 			let mut prfc = prf.clone();
 			prfc.input(SALT_PREFIX.as_bytes());
 			prfc.input(unprefixed_salt);
 			prfc.input(&u32_to_array_be((i + 1) as u32));
 
-			let s = hmac::Hmac::from_engine(prfc).into_inner();
+			let s: [u8; 64] = hmac::Hmac::from_engine(prfc).into_inner();
 			xor(chunk, &s);
 			s
 		};
