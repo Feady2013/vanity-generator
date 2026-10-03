@@ -78,10 +78,6 @@ jobs:
           echo "当前 HEAD                                    单路径：${CUR1}/s"
           echo "当前 HEAD                                    批派生8：${CUR8}/s"
           if [ "${BASE1}" -gt 0 ] && [ "${CUR1}" -gt 0 ]; then
-            python3 -c "
-            b, c, c8 = ${BASE1}, ${CUR1}, ${CUR8}
-            print(f'单路径相对基线：{(c/b-1)*100:+.1f}%（±5% 属 runner 噪声，<2% 视为无差异）')
-            if c8 > 0:
-                print(f'批派生(8) 相对单路径：{(c8/c-1)*100:+.1f}%')
-            "
+            python3 -c "b,c,c8=${BASE1},${CUR1},${CUR8};print(f'单路径相对基线：{(c/b-1)*100:+.1f}%（±5% 属 runner 噪声，<2% 视为无差异）')"
+            [ "${CUR8}" -gt 0 ] && python3 -c "c,c8=${CUR1},${CUR8};print(f'批派生(8) 相对单路径：{(c8/c-1)*100:+.1f}%')"
           fi
