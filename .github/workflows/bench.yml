@@ -46,10 +46,10 @@ jobs:
       - name: 基准当前（单路径 + 批派生）
         run: |
           cd /tmp/cur && cp /tmp/bench.asc .
-          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\nthreads: 1\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
           timeout 22 ./vanity-generator > /tmp/cur-single.log 2>&1 || true
           CUR1=$(grep -a "进度" /tmp/cur-single.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
-          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 20000\nthreads: 1\nderive_batch: 8\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 20000\nderive_batch: 8\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
           timeout 22 ./vanity-generator > /tmp/cur-batch.log 2>&1 || true
           CUR8=$(grep -a "进度" /tmp/cur-batch.log | tail -1 | grep -oE "(速率|平均) [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
           [ "$CUR8" = "0" ] && { echo "批派生测量失败，日志尾部："; tail -5 /tmp/cur-batch.log; }
@@ -64,7 +64,7 @@ jobs:
           # 基线提交无 vendor 缓存，离线优先失败则在线拉取
           cargo build --release --offline 2>/dev/null || cargo build --release
           cd /tmp/base/target/release && cp /tmp/bench.asc .
-          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\nthreads: 1\ngpg_key_file: "/tmp/base/target/release/bench.asc"\n')"
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\ngpg_key_file: "/tmp/base/target/release/bench.asc"\n')"
           timeout 22 ./vanity-generator > /tmp/base-single.log 2>&1 || true
           BASE1=$(grep -a "进度" /tmp/base-single.log | tail -1 | grep -oE "(速率|平均) [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
           [ "$BASE1" = "0" ] && { echo "基线测量失败，日志尾部："; tail -5 /tmp/base-single.log; }
@@ -73,7 +73,7 @@ jobs:
 
       - name: 输出对比结论
         run: |
-          echo "===== 实机性能对比（同一 runner，单线程 15s 窗口）====="
+          echo "===== 实机性能对比（同一 runner，默认全核 15s 窗口）====="
           echo "基线 ${{ inputs.base_sha || 'e9e24f0' }}（derive_batch 之前） 单路径：${BASE1}/s"
           echo "当前 HEAD                                    单路径：${CUR1}/s"
           echo "当前 HEAD                                    批派生8：${CUR8}/s"
