@@ -102,6 +102,29 @@ RUSTFLAGS="-Cprofile-use=/tmp/vanity.profdata" cargo build --release --offline
   提示，不改变语义）——用 `cargo test --release` 复核后即可替换部署
 - 收益门槛：±3% 以内多为噪声，≥2% 才值得维护 profile 文件
 
+
+## 多核/多机部署调优（硬件视角）
+
+长时间高并发搜索时，让程序"对 CPU 友好"的部署层手段（零代码改动）：
+
+```bash
+# ① CPU 亲和：把进程钉在指定核上，减少迁移带来的 L1/L2 失效
+#    （容器里 cpuset 已天然限核，此招对裸机收益最明显）
+taskset -c 0-3 ./vanity-generator
+
+# ② NUMA 系统（多路服务器）：优先本地内存 + 本地核
+numactl --cpunodebind=0 --membind=0 ./vanity-generator
+
+# ③ 线程数建议：threads 默认 = 逻辑核数（含超线程）。纯 ALU 密集的
+#    派生负载在部分架构上"物理核数"反而更稳（超线程同胞争用执行端口），
+#    可各测一轮取快者
+```
+
+程序内部已做的硬件友好设计：共享计数器独占缓存行（防伪共享）、匹配器
+栈缓冲 + memcmp 前置剪枝 + SIMD 中缀搜索（`memchr` 运行时 AVX2）、
+命中才计算 EIP-55 校验和、批派生摊销种子成本（`derive_batch: 8`）。
+生产二进制可再叠加 PGO（见上文「生产环境 PGO」）。
+
 ## Docker 部署
 
 ```bash

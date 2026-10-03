@@ -42,6 +42,21 @@ struct Cli {
     check: bool,
 }
 
+/// 64 字节对齐的原子包装（消除伪共享）。
+///
+/// 硬件视角：相邻原子变量若落在同一缓存行，多核写入会造成缓存行在核间
+/// 乒乓（MESI Invalidate）；长时间高并发下即使单次开销极小，累积效应
+/// 可观。各自独占一个 64B 缓存行后写互不失效（参考 docs/perf-research.md
+/// §8 硬件视角优化与《现代 CPU 性能》笔记 §4.6）。
+#[repr(align(64))]
+struct PadAtomic<T>(T);
+
+impl<T> PadAtomic<T> {
+    fn new(v: T) -> Self {
+        Self(v)
+    }
+}
+
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
@@ -103,16 +118,17 @@ fn run() -> Result<()> {
     let started = Instant::now();
     let stopped = AtomicBool::new(false);
     let failed = AtomicBool::new(false);
-    let attempts = AtomicU64::new(0);
-    let hits = AtomicU32::new(0);
+    // 共享原子各自独占缓存行（见 PadAtomic 文档）
+    let attempts = PadAtomic::new(AtomicU64::new(0));
+    let hits = PadAtomic::new(AtomicU32::new(0));
     let progress_lock = Mutex::new(()); // 进度行原子输出
     let (tx, rx) = unbounded::<vanity_generator::generator::HitRecord>();
     let seq = AtomicU32::new(0);
     let encrypt_err: Mutex<Option<VanityError>> = Mutex::new(None);
     // 上次进度通知的（全局序号, 毫秒时刻）：用于瞬时速率，长跑时宿主机
     // 波动/频率调整能被直接看到，累计均值不再误导（Docker 长跑实测教训）
-    let last_prog_ticket = AtomicU64::new(0);
-    let last_prog_ms = AtomicU64::new(0);
+    let last_prog_ticket = PadAtomic::new(AtomicU64::new(0));
+    let last_prog_ms = PadAtomic::new(AtomicU64::new(0));
 
     // 调度架构：std::thread::scope 派生 N 个原生 OS 线程（非工作窃取池）。
     // 理由：本负载是 N 个粗粒度独立搜索循环，无细粒度可窃取任务，
@@ -134,11 +150,11 @@ fn run() -> Result<()> {
                 let tx = tx.clone();
                 let stopped = &stopped;
                 let failed = &failed;
-                let attempts = &attempts;
-                let hits = &hits;
+                let attempts = &attempts.0;
+                let hits = &hits.0;
                 let progress_lock = &progress_lock;
-                let last_t = &last_prog_ticket;
-                let last_ms = &last_prog_ms;
+                let last_t = &last_prog_ticket.0;
+                let last_ms = &last_prog_ms.0;
                 s.spawn(move || {
                     // 每个 worker 独立持有生成器上下文（无锁竞争）
                     let mut gen = match Generator::new(cfg_wc, cfg_path, cfg_indices, cfg_cs) {
@@ -210,7 +226,7 @@ fn run() -> Result<()> {
                 let n = seq.fetch_add(1, Ordering::Relaxed) + 1;
                 match encryptor.encrypt_to_file(&hit, &cfg.output_dir, n) {
                     Ok(path) => {
-                        hits.store(n, Ordering::Relaxed);
+                        hits.0.store(n, Ordering::Relaxed);
                         encrypted_files.push(path.clone());
                         println!(
                             "[命中 #{:03}] 地址 {} | 已加密 → {}",
@@ -234,8 +250,8 @@ fn run() -> Result<()> {
     }
 
     // 4. 汇总
-    let total = attempts.load(Ordering::Relaxed);
-    let hit_n = hits.load(Ordering::Relaxed);
+    let total = attempts.0.load(Ordering::Relaxed);
+    let hit_n = hits.0.load(Ordering::Relaxed);
     let elapsed = started.elapsed().as_secs_f64();
     if let Some(e) = encrypt_err.into_inner().unwrap_or_else(|p| p.into_inner()) {
         return Err(e.into());
