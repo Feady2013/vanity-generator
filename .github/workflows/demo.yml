@@ -1,6 +1,6 @@
 name: 靓号演示（多机并行·共同目标）
 
-# 手动触发的多机并行演示（v5）：
+# 定时 + 手动触发的多机并行演示（v5）：
 #
 # - 编译前移：setup 任务统一编译并上传二进制工件，matrix 机器直接下载
 #   运行（省去每台 3-5 分钟的重复编译）
@@ -11,17 +11,27 @@ name: 靓号演示（多机并行·共同目标）
 # - API 防挂起：轮询的 gh api 均带 timeout 15s，杜绝网络挂起卡死循环
 # - 零命中不发布：未命中任何地址时删除演示 Release（不发布空产物）
 # - 发布形态：固定 prerelease 标签 demo-latest（不占 Latest、不堆积标签）
+# - 定时执行：每小时整点触发一次（UTC），每次 20 台机器并行、每台搜索 35 分钟
+
 on:
+  schedule:
+    # ★ 改动 1：每小时整点执行一次（cron 为 UTC 时间）
+    - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       machines:
         description: 并行机器数（1-20）
         required: false
-        default: "8"
+        default: "20"          # ★ 改动 2：默认 20 台
       timeout_minutes:
         description: 每台机器的搜索时限（分钟）
         required: false
-        default: "15"
+        default: "35"          # ★ 改动 3：默认 35 分钟
+
+# ★ 改动 4：并发组——上一轮若未结束，下一轮排队而非取消/堆积
+concurrency:
+  group: demo-hourly
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -67,7 +77,9 @@ jobs:
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
+
       - uses: dtolnay/rust-toolchain@stable
+
       - name: 缓存依赖
         uses: Swatinem/rust-cache@v2
 
@@ -87,13 +99,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
         run: |
-          N=${{ inputs.machines || '8' }}
+          N=${{ inputs.machines || '20' }}          # ★ 改动 5：schedule 触发时 inputs 为空，兜底值由 8 改为 20
           if ! [ "$N" -ge 1 ] 2>/dev/null; then N=1; fi
           if [ "$N" -gt 20 ]; then N=20; fi
           MATRIX=$(seq 1 "$N" | sed 's/^/"/;s/$/"/' | paste -sd, - | sed 's/^/[/;s/$/]/')
           echo "矩阵：$MATRIX"
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "machines=$N" >> "$GITHUB_OUTPUT"
+
           # 全力并行：机器启动即开搜（无错峰延迟）
           # 固定单一 prerelease 标签 demo-latest：不存在则创建，存在则清空旧资产（全局计数归零）
           if ! gh release view demo-latest > /dev/null 2>&1; then
@@ -107,9 +120,9 @@ jobs:
     name: 搜索 (${{ matrix.machine }}/${{ needs.setup.outputs.machines }})
     needs: setup
     runs-on: ubuntu-latest
-    # 任务级硬超时（分钟）：搜索时限 ≤20 + 下载/上报余量（GitHub 表达式
+    # 任务级硬超时（分钟）：搜索时限 ≤35 + 下载/上报余量（GitHub 表达式
     # 不支持算术，取保守上界；循环内的精确时限以 TM 为准）
-    timeout-minutes: 40
+    timeout-minutes: 55          # ★ 改动 6：由 40 → 55（35 分钟搜索 + 约 20 分钟余量）
     strategy:
       fail-fast: false
       matrix:
@@ -135,7 +148,7 @@ jobs:
           chmod +x ./vanity-generator
           M="$MACHINE"
           TARGET="$TARGET"
-          TM=${{ inputs.timeout_minutes || '15' }}
+          TM=${{ inputs.timeout_minutes || '35' }}   # ★ 改动 7：兜底值由 15 改为 35
           N=${{ needs.setup.outputs.machines }}
           echo "机器 $M/$N：共同目标 $TARGET 个地址，时限 ${TM} 分钟，全力并行"
           mkdir -p /tmp/out
@@ -171,6 +184,7 @@ jobs:
           uploaded=""
           killed=0
           prev_line=""
+
           while kill -0 "$BIN" 2>/dev/null; do
             upload_new_hits
             # 进度行实时透传（仅变化时打印）
@@ -194,6 +208,7 @@ jobs:
             [ "$N" -gt 10 ] && [ $(( SECONDS - start )) -ge 60 ] && SLEEP=12
             sleep "$SLEEP"
           done
+
           # GitHub 的 bash 默认 -e：被 kill 的进程 wait 返回 143，需 || 捕获
           RC=0
           wait "$BIN" 2>/dev/null || RC=$?
@@ -203,8 +218,10 @@ jobs:
             exit 1
           fi
           upload_new_hits || true
+
           cp run.log "/tmp/out/log-machine-${M}.log"
           timeout 30 gh release upload demo-latest "/tmp/out/log-machine-${M}.log" --clobber || true
+
           echo "===== 本机完整运行日志 ====="
           cat run.log
 
@@ -221,58 +238,33 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
-      # ── 进入本任务立即打印全部密文，之后再做汇总与发布 ──
-      - name: 打印全部 GPG 加密密文（每个密文完整输出一次）
-        run: |
-          set -u
-          mkdir -p cipher
-          # 下载 demo-latest 上全部命中产物（矩阵资产命名：m{机器号}-vanity_*.asc）
-          timeout 60 gh release download demo-latest --pattern 'm*-vanity_*.asc' --dir cipher 2>/dev/null || true
-          total=$(find cipher -name '*.asc' 2>/dev/null | wc -l)
-          if [ "$total" -eq 0 ]; then
-            echo "::notice::当前 Release 上暂无 .asc 加密产物，跳过打印，继续后续流程。"
-            exit 0
-          fi
-          echo "已下载 $total 个加密产物，开始逐个完整打印："
-          i=0
-          for f in cipher/*.asc; do
-            [ -f "$f" ] || continue
-            i=$((i+1))
-            printf '\n'
-            echo "===================== 密文 $i / $total ====================="
-            echo "文件：$(basename "$f")"
-            echo "---------------------------------------------------------------------"
-            cat "$f"
-            printf '\n'
-            echo "---------------------------------------------------------------------"
-          done
-          printf '\n'
-          echo "共打印 $i 个加密密文；以上 ASCII Armor 密文仅持对应 GPG 私钥者可解密。"
-
       - name: 汇总与整理（零命中不发布）
         run: |
-          set -u
           TARGET=${{ needs.setup.outputs.count }}
           HITS=$(timeout 15 gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
-            --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo 0)
-          echo "全局命中：$HITS / 目标 $TARGET"
-          if [ "$HITS" -eq 0 ]; then
+            --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo -1)
+          echo "共同目标：$TARGET；全局命中：$HITS"
+
+          if [ "$HITS" -lt 1 ]; then
             echo "::notice::本次运行未命中任何地址——按约定不发布 Release（删除演示 Release 及全部临时资产）。"
             timeout 30 gh release delete demo-latest --yes || true
             exit 0
           fi
+
           # 下载 1 号机日志提取难度提示（如有）
           EXPECT=""
           if timeout 30 gh release download demo-latest --pattern 'log-machine-*.log' --dir logs 2>/dev/null; then
             EXPECT=$(grep -h "期望尝试" logs/log-machine-*.log 2>/dev/null | head -1 || true)
           fi
           echo "规则难度：${EXPECT:-（见各机器日志）}"
+
           STATUS="已完成共同目标"
           [ "$HITS" -lt "$TARGET" ] && STATUS="未在时限内完成共同目标（$HITS/$TARGET）"
+
           {
             echo "## 靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行"
             echo ""
-            echo "- 并行机器：${{ inputs.machines || '8' }} 台（启动即全力并行）"
+            echo "- 并行机器：${{ inputs.machines || '20' }} 台（启动即全力并行）"   # ★ 改动 8：兜底值 8 → 20
             echo "- 共同目标：$TARGET 个地址（全部机器达标即停）"
             echo "- 状态：$STATUS"
             echo "- ${EXPECT}"
@@ -280,6 +272,7 @@ jobs:
             echo "- 本 Release 为预发布（prerelease），固定复用 demo-latest 标签，不占用 Latest"
           } > notes.md
           cat notes.md
+
           timeout 30 gh release edit demo-latest \
             --title "靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行" \
             --notes-file notes.md --prerelease
