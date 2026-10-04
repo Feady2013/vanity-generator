@@ -221,13 +221,42 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
+      # ── 进入本任务立即打印全部密文，之后再做汇总与发布 ──
+      - name: 打印全部 GPG 加密密文（每个密文完整输出一次）
+        run: |
+          set -u
+          mkdir -p cipher
+          # 下载 demo-latest 上全部命中产物（矩阵资产命名：m{机器号}-vanity_*.asc）
+          timeout 60 gh release download demo-latest --pattern 'm*-vanity_*.asc' --dir cipher 2>/dev/null || true
+          total=$(find cipher -name '*.asc' 2>/dev/null | wc -l)
+          if [ "$total" -eq 0 ]; then
+            echo "::notice::当前 Release 上暂无 .asc 加密产物，跳过打印，继续后续流程。"
+            exit 0
+          fi
+          echo "已下载 $total 个加密产物，开始逐个完整打印："
+          i=0
+          for f in cipher/*.asc; do
+            [ -f "$f" ] || continue
+            i=$((i+1))
+            printf '\n'
+            echo "===================== 密文 $i / $total ====================="
+            echo "文件：$(basename "$f")"
+            echo "---------------------------------------------------------------------"
+            cat "$f"
+            printf '\n'
+            echo "---------------------------------------------------------------------"
+          done
+          printf '\n'
+          echo "共打印 $i 个加密密文；以上 ASCII Armor 密文仅持对应 GPG 私钥者可解密。"
+
       - name: 汇总与整理（零命中不发布）
         run: |
+          set -u
           TARGET=${{ needs.setup.outputs.count }}
           HITS=$(timeout 15 gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
-            --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo -1)
-          echo "共同目标：$TARGET；全局命中：$HITS"
-          if [ "$HITS" -lt 1 ]; then
+            --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo 0)
+          echo "全局命中：$HITS / 目标 $TARGET"
+          if [ "$HITS" -eq 0 ]; then
             echo "::notice::本次运行未命中任何地址——按约定不发布 Release（删除演示 Release 及全部临时资产）。"
             timeout 30 gh release delete demo-latest --yes || true
             exit 0
