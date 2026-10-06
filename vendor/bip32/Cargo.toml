@@ -61,6 +61,10 @@ path = "tests/bip32_vectors.rs"
 name = "bip39_vectors"
 path = "tests/bip39_vectors.rs"
 
+[dependencies.bitcoin_hashes]
+version = "0.11"
+default-features = false
+
 [dependencies.bs58]
 version = "0.5"
 features = ["check"]

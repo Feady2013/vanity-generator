@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bip32::{ChildNumber, XPrv};
 use bip39::{Language, Mnemonic};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::SecretKey;
+use k256::{ProjectivePoint, SecretKey};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 use tiny_keccak::{Hasher, Keccak};
@@ -207,9 +207,13 @@ impl Generator {
         })?;
         // 父层统一只派生到倒数第二层：末层交给逐地址循环（batch=1 时
         // 子索引 = 原末层索引，行为与旧版完全一致）
+        // 中间层派生跳过 parent_fingerprint（BIP32：指纹仅序列化识别用，
+        // 不参与 CKD 计算；本程序热路径不序列化中间层）——hardened 中间层
+        // 免除全部父公钥标量乘，差分门禁见
+        // 跳过指纹派生与逐个派生密钥_bit_exact_一致。
         let parent_cns = &self.path_cns[..self.path_cns.len().saturating_sub(1)];
         for &cn in parent_cns {
-            xprv = xprv.derive_child(cn).map_err(|e| {
+            xprv = xprv.derive_child_nofingerprint(cn).map_err(|e| {
                 VanityError::internal(
                     format!("bip32 child derivation failed: {e}"),
                     format!("BIP32 子密钥派生失败：{e}"),
@@ -231,24 +235,33 @@ impl Generator {
         } else {
             self.derive_batch
         };
-        for i in 0..batch {
-            // 末层子密钥：基索引 + i（保留原末层 hardened 属性）
-            let child_xprv = if self.path_cns.is_empty() {
-                xprv.clone()
-            } else {
-                let cn = ChildNumber::new(last_idx + i, last_hardened).map_err(|e| {
-                    VanityError::internal(
-                        format!("invalid BIP32 child number {:#010x}: {e}", last_idx + i),
-                        format!("非法 BIP32 子索引 {:#010x}：{e}", last_idx + i),
-                    )
-                })?;
-                xprv.derive_child(cn).map_err(|e| {
-                    VanityError::internal(
-                        format!("bip32 child derivation failed: {e}"),
-                        format!("BIP32 子密钥派生失败：{e}"),
-                    )
-                })?
-            };
+        // 末层批量派生：derive_children 摊销同父重复计算（父公钥 ×2、
+        // fingerprint、HMAC ipad/opad 状态每批一次），每 child 的 HMAC
+        // 消息与逐个 derive_child 逐字节一致（差分门禁见测试
+        // bip32_批量派生与逐个派生_bit_exact_一致 / 批派生地址序列与逐路径一致）。
+        // batch=1（默认，单助记词→单地址主用途）时同样走该路径，行为不变。
+        let child_xprvs: Vec<XPrv> = if self.path_cns.is_empty() {
+            (0..batch).map(|_| xprv.clone()).collect()
+        } else {
+            let children: Result<Vec<ChildNumber>, VanityError> = (0..batch)
+                .map(|i| {
+                    ChildNumber::new(last_idx + i, last_hardened).map_err(|e| {
+                        VanityError::internal(
+                            format!("invalid BIP32 child number {:#010x}: {e}", last_idx + i),
+                            format!("非法 BIP32 子索引 {:#010x}：{e}", last_idx + i),
+                        )
+                    })
+                })
+                .collect();
+            xprv.derive_children_nofingerprint(&children?).map_err(|e| {
+                VanityError::internal(
+                    format!("bip32 child derivation failed: {e}"),
+                    format!("BIP32 子密钥派生失败：{e}"),
+                )
+            })?
+        };
+        for (i, child_xprv) in child_xprvs.into_iter().enumerate() {
+            let i = i as u32;
 
             // 6. 私钥范围检查 [1, n-1]：from_slice 拒绝 0 与 ≥n
             let sk = SecretKey::from_slice(child_xprv.to_bytes().as_slice()).map_err(|e| {
@@ -259,7 +272,14 @@ impl Generator {
             })?;
 
             // 7. 公钥（未压缩 65 字节：04 || x || y，取 x||y 共 64 字节）
-            let point = sk.public_key().as_affine().to_encoded_point(false);
+            //    走 k256 预计算生成元表（30KB 静态 GEN_LOOKUP_TABLE）的
+            //    mul_by_generator：结果 = G×sk 数学恒等；较默认路径
+            //    （from_secret_scalar 的通用 GLV 乘法，每次现场构建查找表）
+            //    免除表构建与标量分解开销。
+            use k256::elliptic_curve::ops::MulByGenerator;
+            let point = ProjectivePoint::mul_by_generator(sk.to_nonzero_scalar().as_ref())
+                .to_affine()
+                .to_encoded_point(false);
             let xy = point.as_bytes().get(1..65).ok_or_else(|| {
                 VanityError::internal("unexpected SEC1 encoding length", "SEC1 编码长度异常")
             })?;
@@ -559,6 +579,216 @@ mod tests {
             hex::encode(h0n1.to_bytes()),
             "3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368"
         );
+    }
+
+    /// XPrv::new 直驱差分门禁：64B seed（BIP39 to_seed 唯一输出，热路径
+    /// 全覆盖）的常量 midstate 快路径 vs RustCrypto 原引擎 HMAC，私钥与
+    /// 链码必须 bit-exact。种子含边界值与确定性伪随机序列。
+    #[test]
+    fn xprv_new_64b_快路径与原引擎_bit_exact() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512Rc = Hmac<Sha512>;
+
+        // 构造测试种子集：全 0 / 全 ff / xorshift 确定性序列
+        let mut seeds: Vec<[u8; 64]> = vec![[0u8; 64], [0xffu8; 64]];
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..8 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut seed = [0u8; 64];
+            for c in seed.chunks_mut(8) {
+                let y = x.wrapping_mul(0x2545F4914F6CDD1D).rotate_left(17);
+                c.copy_from_slice(&y.to_le_bytes());
+                x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            }
+            seeds.push(seed);
+        }
+
+        for seed in &seeds {
+            // 快路径（直驱）
+            let xprv = XPrv::new(seed).unwrap();
+            // 对照：RustCrypto 原引擎（与 BIP32 规范一致的标准 HMAC）
+            let mut mac = HmacSha512Rc::new_from_slice(b"Bitcoin seed").unwrap();
+            mac.update(seed);
+            let out = mac.finalize().into_bytes();
+            let key: Vec<u8> = AsRef::<[u8]>::as_ref(&xprv.private_key().to_bytes()).to_vec();
+            let chain: Vec<u8> = AsRef::<[u8]>::as_ref(&xprv.attrs().chain_code).to_vec();
+            assert_eq!(key, out[..32].to_vec(), "私钥不一致：seed={}", hex::encode(seed));
+            assert_eq!(chain, out[32..64].to_vec(), "链码不一致：seed={}", hex::encode(seed));
+        }
+    }
+
+    /// XPrv::new 非 64B seed（16/32B，fallback 原引擎路径）回归：
+    /// 与手工 HMAC 一致，且官方 BIP32 向量 1（16B）继续锚定。
+    #[test]
+    fn xprv_new_短种子_fallback与原引擎_bit_exact() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512Rc = Hmac<Sha512>;
+
+        let seeds: [&[u8]; 3] = [
+            &hex::decode("000102030405060708090a0b0c0d0e0f").unwrap(), // 官方向量 1
+            &[0x42u8; 16],
+            &[0x42u8; 32],
+        ];
+        for seed in seeds {
+            let xprv = XPrv::new(seed).unwrap();
+            let mut mac = HmacSha512Rc::new_from_slice(b"Bitcoin seed").unwrap();
+            mac.update(seed);
+            let out = mac.finalize().into_bytes();
+            let key: Vec<u8> = AsRef::<[u8]>::as_ref(&xprv.private_key().to_bytes()).to_vec();
+            let chain: Vec<u8> = AsRef::<[u8]>::as_ref(&xprv.attrs().chain_code).to_vec();
+            assert_eq!(key, out[..32].to_vec());
+            assert_eq!(chain, out[32..64].to_vec());
+        }
+    }
+
+    /// 差分门禁：vendored bip32 新增的 derive_children（批量摊销路径：
+    /// 父公钥/fingerprint/HMAC ipad-opad 每批一次）与逐个 derive_child
+    /// 必须 bit-exact 一致。覆盖非 hardened / hardened / 混合 / 大索引 /
+    /// 重复索引 / 单元素 / 空 / 深层再派生。
+    #[test]
+    fn bip32_批量派生与逐个派生_bit_exact_一致() {
+        let seed = [0x42u8; 64];
+        let master = XPrv::new(seed).unwrap();
+        let cases: &[Vec<(u32, bool)>] = &[
+            vec![(0, false), (1, false), (2, false), (3, false), (7, false)],
+            vec![(0, true), (1, true), (2, true)],
+            vec![(0, false), (0xFF, true), (100_000_000, false), (0, false), (1, true)],
+            vec![(7, false)],
+            vec![],
+        ];
+        for seq in cases {
+            let children: Vec<ChildNumber> = seq
+                .iter()
+                .map(|&(n, h)| ChildNumber::new(n, h).unwrap())
+                .collect();
+            let batch = master.derive_children(&children).unwrap();
+            assert_eq!(batch.len(), children.len());
+            for (i, &cn) in children.iter().enumerate() {
+                let one = master.derive_child(cn).unwrap();
+                assert_eq!(
+                    batch[i].to_bytes().as_ref(),
+                    one.to_bytes().as_ref(),
+                    "child #{i} ({cn:?}) 私钥不一致"
+                );
+            }
+        }
+        // 深层再派生（确保链码/attrs 无误，同路径序列批量结果可继续正确派生）
+        let batch = master
+            .derive_children([ChildNumber::new(0, false).unwrap()].as_slice())
+            .unwrap();
+        let deep_batch = batch[0]
+            .derive_children([ChildNumber::new(5, false).unwrap()].as_slice())
+            .unwrap();
+        let deep_one = master
+            .derive_child(ChildNumber::new(0, false).unwrap())
+            .unwrap()
+            .derive_child(ChildNumber::new(5, false).unwrap())
+            .unwrap();
+        assert_eq!(deep_batch[0].to_bytes().as_ref(), deep_one.to_bytes().as_ref());
+    }
+
+    /// 差分门禁：跳过指纹变体（derive_child_nofingerprint /
+    /// derive_children_nofingerprint）与原版 derive_child 的
+    /// 私钥/链码/深度/子编号必须 bit-exact；唯一差异 =
+    /// attrs.parent_fingerprint 为零值（BIP32：指纹仅序列化识别用，
+    /// 不参与 CKD 计算）。覆盖 hardened/非硬化/混合/批量序列。
+    #[test]
+    fn 跳过指纹派生与逐个派生密钥_bit_exact_一致() {
+        let seed = [0x5au8; 64];
+        let master = XPrv::new(seed).unwrap();
+        let cases: &[Vec<(u32, bool)>] = &[
+            vec![(0, false), (1, false), (2, false)],
+            vec![(0, true), (1, true), (2, true)],
+            vec![(0, false), (0xFF, true), (100_000_000, false)],
+            vec![(7, false)],
+            vec![],
+        ];
+        for seq in cases {
+            let children: Vec<ChildNumber> = seq
+                .iter()
+                .map(|&(n, h)| ChildNumber::new(n, h).unwrap())
+                .collect();
+            // 批量变体
+            let batch = master.derive_children_nofingerprint(&children).unwrap();
+            assert_eq!(batch.len(), children.len());
+            for (i, &cn) in children.iter().enumerate() {
+                let one = master.derive_child(cn).unwrap();
+                let nf = master.derive_child_nofingerprint(cn).unwrap();
+                // 密钥/链码/深度/编号 bit-exact
+                for x in [&batch[i], &nf] {
+                    let xk: Vec<u8> = AsRef::<[u8]>::as_ref(&x.private_key().to_bytes()).to_vec();
+                    let ok: Vec<u8> = AsRef::<[u8]>::as_ref(&one.private_key().to_bytes()).to_vec();
+                    let xc: Vec<u8> = x.attrs().chain_code.as_ref().to_vec();
+                    let oc: Vec<u8> = one.attrs().chain_code.as_ref().to_vec();
+                    assert_eq!(xk, ok);
+                    assert_eq!(xc, oc);
+                    assert_eq!(x.attrs().depth, one.attrs().depth);
+                    assert_eq!(x.attrs().child_number, one.attrs().child_number);
+                    // 唯一允许的差异：跳指纹版为零值；原版为真实 HASH160 前 4 字节
+                    let xf: Vec<u8> = x.attrs().parent_fingerprint.as_ref().to_vec();
+                    let of: Vec<u8> = one.attrs().parent_fingerprint.as_ref().to_vec();
+                    assert_eq!(xf, vec![0u8; 4]);
+                    assert_eq!(of.len(), 4);
+                }
+            }
+        }
+        // 深层：跳指纹结果的再派生也与原版一致（密钥链完整性）
+        let a = master.derive_children_nofingerprint(&[ChildNumber::new(0, true).unwrap()]).unwrap();
+        let deep_a = a[0].derive_children_nofingerprint(&[ChildNumber::new(5, false).unwrap()]).unwrap();
+        let b = master.derive_child(ChildNumber::new(0, true).unwrap()).unwrap();
+        let deep_b = b.derive_child(ChildNumber::new(5, false).unwrap()).unwrap();
+        let dk: Vec<u8> = AsRef::<[u8]>::as_ref(&deep_a[0].private_key().to_bytes()).to_vec();
+        let dok: Vec<u8> = AsRef::<[u8]>::as_ref(&deep_b.private_key().to_bytes()).to_vec();
+        assert_eq!(dk, dok);
+        assert_eq!(deep_a[0].attrs().chain_code.as_ref().to_vec(), deep_b.attrs().chain_code.as_ref().to_vec());
+    }
+
+    /// 端到端差分：跳指纹路径（前 4 层 derive_child_nofingerprint +
+    /// 末层 derive_children_nofingerprint）产出的地址与原实现完全一致。
+    #[test]
+    fn 跳指纹路径端到端地址一致() {
+        let m = Matcher::new(false, None, None, None);
+        let entropy = [0x33u8; 32];
+        let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false)
+            .unwrap()
+            .with_derive_batch(3);
+        let (hits, n) = g.derive_and_match(&entropy, &m).unwrap();
+        assert_eq!(n, 3);
+        for i in 0..3u32 {
+            let indices = [0x8000_002C, 0x8000_003C, 0x8000_0000, 0, i];
+            let mut g1 = Generator::new(24, "m/44'/60'/0'/0/x", &indices, false).unwrap();
+            let (h1, _) = g1.derive_and_match(&entropy, &m).unwrap();
+            assert_eq!(hits[i as usize].address, h1[0].address);
+        }
+    }
+
+    /// 端到端差分：批派生（derive_children 路径）产出的地址序列与
+    /// 逐路径单派生完全一致（同助记词、逐个索引）。
+    #[test]
+    fn 批派生地址序列与逐路径一致() {
+        let m = Matcher::new(false, None, None, None); // 全命中
+        let entropy = [0x11u8; 32];
+        // 批 4：末层 0..3 连续
+        let mut g_batch = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false)
+            .unwrap()
+            .with_derive_batch(4);
+        let (hits_batch, n) = g_batch.derive_and_match(&entropy, &m).unwrap();
+        assert_eq!(n, 4);
+        // 逐路径：i=0..3（注意 path_indices 才是实际派生层，path 仅显示用）
+        for i in 0..4u32 {
+            let indices = [0x8000_002C, 0x8000_003C, 0x8000_0000, 0, i];
+            let path = format!("m/44'/60'/0'/0/{i}");
+            let mut g = Generator::new(24, &path, &indices, false).unwrap();
+            let (hits_one, _) = g.derive_and_match(&entropy, &m).unwrap();
+            assert_eq!(
+                hits_batch[i as usize].address, hits_one[0].address,
+                "批量第 {i} 个地址与单派生不一致"
+            );
+        }
     }
 
     /// 同熵同参数必须可重现（确定性要求）

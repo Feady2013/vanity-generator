@@ -204,6 +204,10 @@ RUSTFLAGS="-Cprofile-use=/tmp/vanity.profdata" cargo build --release --offline
 - 重建产物与普通构建**行为完全一致**（PGO 只改变代码布局与分支预测
   提示，不改变语义）——用 `cargo test --release` 复核后即可替换部署
 - 收益门槛：±3% 以内多为噪声，≥2% 才值得维护 profile 文件
+- 诚实参考：本项目 CI 实测 PGO 收益 ±0.4%（噪声级）——派生负载的
+  SHA-512 压缩是紧凑直线代码、分支行为极稳定，PGO 无用武之地；
+  若你的生产机（如 AMD Zen4/Intel 新架构）想再压一把，跑一次
+  `pgo.yml` 同款流程实测后再决定
 
 
 ## 多核/多机部署调优（硬件视角）

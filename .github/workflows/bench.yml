@@ -49,7 +49,7 @@ jobs:
           export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 2000\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
           timeout 22 ./vanity-generator > /tmp/cur-single.log 2>&1 || true
           CUR1=$(grep -a "进度" /tmp/cur-single.log | tail -1 | grep -oE "平均 [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
-          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffff"\ncount: 1\nprogress_every: 20000\nderive_batch: 8\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
+          export VANITY_CONFIG="$(printf 'word_count: 24\nfront: "ffffff"\ncount: 1\nprogress_every: 5000\nderive_batch: 8\ngpg_key_file: "/tmp/cur/bench.asc"\n')"
           timeout 22 ./vanity-generator > /tmp/cur-batch.log 2>&1 || true
           CUR8=$(grep -a "进度" /tmp/cur-batch.log | tail -1 | grep -oE "(速率|平均) [0-9]+/s" | grep -oE "[0-9]+" || echo 0)
           [ "$CUR8" = "0" ] && { echo "批派生测量失败，日志尾部："; tail -5 /tmp/cur-batch.log; }

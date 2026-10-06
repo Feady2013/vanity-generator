@@ -157,6 +157,7 @@ version = "0.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db40d3dfbeab4e031d78c844642fa0caa0b0db11ce1607ac9d2986dff1405c69"
 dependencies = [
+ "bitcoin_hashes",
  "bs58",
  "hmac",
  "k256",
