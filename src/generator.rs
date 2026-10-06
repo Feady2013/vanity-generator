@@ -207,9 +207,13 @@ impl Generator {
         })?;
         // 父层统一只派生到倒数第二层：末层交给逐地址循环（batch=1 时
         // 子索引 = 原末层索引，行为与旧版完全一致）
+        // 中间层派生跳过 parent_fingerprint（BIP32：指纹仅序列化识别用，
+        // 不参与 CKD 计算；本程序热路径不序列化中间层）——hardened 中间层
+        // 免除全部父公钥标量乘，差分门禁见
+        // 跳过指纹派生与逐个派生密钥_bit_exact_一致。
         let parent_cns = &self.path_cns[..self.path_cns.len().saturating_sub(1)];
         for &cn in parent_cns {
-            xprv = xprv.derive_child(cn).map_err(|e| {
+            xprv = xprv.derive_child_nofingerprint(cn).map_err(|e| {
                 VanityError::internal(
                     format!("bip32 child derivation failed: {e}"),
                     format!("BIP32 子密钥派生失败：{e}"),
@@ -249,7 +253,7 @@ impl Generator {
                     })
                 })
                 .collect();
-            xprv.derive_children(&children?).map_err(|e| {
+            xprv.derive_children_nofingerprint(&children?).map_err(|e| {
                 VanityError::internal(
                     format!("bip32 child derivation failed: {e}"),
                     format!("BIP32 子密钥派生失败：{e}"),
@@ -678,6 +682,81 @@ mod tests {
             .derive_child(ChildNumber::new(5, false).unwrap())
             .unwrap();
         assert_eq!(deep_batch[0].to_bytes().as_ref(), deep_one.to_bytes().as_ref());
+    }
+
+    /// 差分门禁：跳过指纹变体（derive_child_nofingerprint /
+    /// derive_children_nofingerprint）与原版 derive_child 的
+    /// 私钥/链码/深度/子编号必须 bit-exact；唯一差异 =
+    /// attrs.parent_fingerprint 为零值（BIP32：指纹仅序列化识别用，
+    /// 不参与 CKD 计算）。覆盖 hardened/非硬化/混合/批量序列。
+    #[test]
+    fn 跳过指纹派生与逐个派生密钥_bit_exact_一致() {
+        let seed = [0x5au8; 64];
+        let master = XPrv::new(seed).unwrap();
+        let cases: &[Vec<(u32, bool)>] = &[
+            vec![(0, false), (1, false), (2, false)],
+            vec![(0, true), (1, true), (2, true)],
+            vec![(0, false), (0xFF, true), (100_000_000, false)],
+            vec![(7, false)],
+            vec![],
+        ];
+        for seq in cases {
+            let children: Vec<ChildNumber> = seq
+                .iter()
+                .map(|&(n, h)| ChildNumber::new(n, h).unwrap())
+                .collect();
+            // 批量变体
+            let batch = master.derive_children_nofingerprint(&children).unwrap();
+            assert_eq!(batch.len(), children.len());
+            for (i, &cn) in children.iter().enumerate() {
+                let one = master.derive_child(cn).unwrap();
+                let nf = master.derive_child_nofingerprint(cn).unwrap();
+                // 密钥/链码/深度/编号 bit-exact
+                for x in [&batch[i], &nf] {
+                    let xk: Vec<u8> = AsRef::<[u8]>::as_ref(&x.private_key().to_bytes()).to_vec();
+                    let ok: Vec<u8> = AsRef::<[u8]>::as_ref(&one.private_key().to_bytes()).to_vec();
+                    let xc: Vec<u8> = x.attrs().chain_code.as_ref().to_vec();
+                    let oc: Vec<u8> = one.attrs().chain_code.as_ref().to_vec();
+                    assert_eq!(xk, ok);
+                    assert_eq!(xc, oc);
+                    assert_eq!(x.attrs().depth, one.attrs().depth);
+                    assert_eq!(x.attrs().child_number, one.attrs().child_number);
+                    // 唯一允许的差异：跳指纹版为零值；原版为真实 HASH160 前 4 字节
+                    let xf: Vec<u8> = x.attrs().parent_fingerprint.as_ref().to_vec();
+                    let of: Vec<u8> = one.attrs().parent_fingerprint.as_ref().to_vec();
+                    assert_eq!(xf, vec![0u8; 4]);
+                    assert_eq!(of.len(), 4);
+                }
+            }
+        }
+        // 深层：跳指纹结果的再派生也与原版一致（密钥链完整性）
+        let a = master.derive_children_nofingerprint(&[ChildNumber::new(0, true).unwrap()]).unwrap();
+        let deep_a = a[0].derive_children_nofingerprint(&[ChildNumber::new(5, false).unwrap()]).unwrap();
+        let b = master.derive_child(ChildNumber::new(0, true).unwrap()).unwrap();
+        let deep_b = b.derive_child(ChildNumber::new(5, false).unwrap()).unwrap();
+        let dk: Vec<u8> = AsRef::<[u8]>::as_ref(&deep_a[0].private_key().to_bytes()).to_vec();
+        let dok: Vec<u8> = AsRef::<[u8]>::as_ref(&deep_b.private_key().to_bytes()).to_vec();
+        assert_eq!(dk, dok);
+        assert_eq!(deep_a[0].attrs().chain_code.as_ref().to_vec(), deep_b.attrs().chain_code.as_ref().to_vec());
+    }
+
+    /// 端到端差分：跳指纹路径（前 4 层 derive_child_nofingerprint +
+    /// 末层 derive_children_nofingerprint）产出的地址与原实现完全一致。
+    #[test]
+    fn 跳指纹路径端到端地址一致() {
+        let m = Matcher::new(false, None, None, None);
+        let entropy = [0x33u8; 32];
+        let mut g = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false)
+            .unwrap()
+            .with_derive_batch(3);
+        let (hits, n) = g.derive_and_match(&entropy, &m).unwrap();
+        assert_eq!(n, 3);
+        for i in 0..3u32 {
+            let indices = [0x8000_002C, 0x8000_003C, 0x8000_0000, 0, i];
+            let mut g1 = Generator::new(24, "m/44'/60'/0'/0/x", &indices, false).unwrap();
+            let (h1, _) = g1.derive_and_match(&entropy, &m).unwrap();
+            assert_eq!(hits[i as usize].address, h1[0].address);
+        }
     }
 
     /// 端到端差分：批派生（derive_children 路径）产出的地址序列与

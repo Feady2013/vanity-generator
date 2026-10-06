@@ -233,6 +233,100 @@ where
         Ok(derived)
     }
 
+    /// [`derive_children`] 的跳过指纹变体：attrs.parent_fingerprint 填
+    /// 零值，其余（私钥/链码/depth/child_number）与逐个 [`derive_child`]
+    /// bit-exact 一致。
+    ///
+    /// 原理（BIP32 规范）：parent_fingerprint = HASH160(父公钥) 前 4 字节，
+    /// 仅用于 XPRV/XPUB 序列化时识别父密钥，**不参与任何 CKD 密钥派生
+    /// 计算**。对不序列化中间层的热路径（如地址批量生成），跳过它可
+    /// 免去 hardened 子密钥的全部父公钥标量乘（fingerprint 是其唯一
+    /// 消费者）与非 hardened 子密钥的 HASH160。
+    ///
+    /// 语义 trade-off（显式命名传达）：结果的 `attrs().parent_fingerprint`
+    /// 为零值——**若把中间密钥序列化为 xprv/xpub 字符串，与逐个派生的
+    /// 输出不同**（密钥/链码/地址完全一致）。仅当不序列化中间层时使用。
+    #[cfg(feature = "alloc")]
+    pub fn derive_children_nofingerprint(&self, children: &[ChildNumber]) -> Result<Vec<Self>> {
+        let depth = self.attrs.depth.checked_add(1).ok_or(Error::Depth)?;
+        // hardened 子密钥在跳过指纹后完全不需要父公钥；非 hardened
+        // 仍需父公钥字节作为 HMAC 消息（CKD 规范输入）。
+        let need_public = children.iter().any(|cn| !cn.is_hardened());
+        let parent_public = if need_public {
+            Some(self.private_key.public_key())
+        } else {
+            None
+        };
+        let base_hmac = HmacSha512::new_from_slice(&self.attrs.chain_code)
+            .map_err(|_| Error::Crypto)?;
+
+        let mut derived = Vec::with_capacity(children.len());
+        for &child_number in children {
+            let mut hmac = base_hmac.clone();
+            if child_number.is_hardened() {
+                hmac.update(&[0]);
+                hmac.update(&self.private_key.to_bytes());
+            } else {
+                hmac.update(parent_public.as_ref().expect("checked above").to_bytes().as_ref());
+            }
+            hmac.update(&child_number.to_bytes());
+
+            let result = hmac.finalize().into_bytes();
+            let (tweak_bytes, chain_code_bytes) = result.split_at(KEY_SIZE);
+            let tweak = PrivateKeyBytes::try_from(tweak_bytes)?;
+            let chain_code = chain_code_bytes.try_into()?;
+
+            let private_key = self.private_key.derive_child(tweak)?;
+            derived.push(ExtendedPrivateKey {
+                private_key,
+                attrs: ExtendedKeyAttrs {
+                    parent_fingerprint: KeyFingerprint::default(),
+                    child_number,
+                    chain_code,
+                    depth,
+                },
+            });
+        }
+        Ok(derived)
+    }
+
+    /// [`derive_child`] 的跳过指纹变体（单子密钥，无 Vec 分配）：语义与
+    /// [`derive_children_nofingerprint`] 相同，密钥/链码 bit-exact，
+    /// attrs.parent_fingerprint 为零值（详见其文档）。
+    pub fn derive_child_nofingerprint(&self, child_number: ChildNumber) -> Result<Self> {
+        let depth = self.attrs.depth.checked_add(1).ok_or(Error::Depth)?;
+        let need_public = !child_number.is_hardened();
+        let parent_public = if need_public {
+            Some(self.private_key.public_key())
+        } else {
+            None
+        };
+        let mut hmac = HmacSha512::new_from_slice(&self.attrs.chain_code)
+            .map_err(|_| Error::Crypto)?;
+        if child_number.is_hardened() {
+            hmac.update(&[0]);
+            hmac.update(&self.private_key.to_bytes());
+        } else {
+            hmac.update(parent_public.as_ref().expect("checked above").to_bytes().as_ref());
+        }
+        hmac.update(&child_number.to_bytes());
+
+        let result = hmac.finalize().into_bytes();
+        let (tweak_bytes, chain_code_bytes) = result.split_at(KEY_SIZE);
+        let tweak = PrivateKeyBytes::try_from(tweak_bytes)?;
+        let chain_code = chain_code_bytes.try_into()?;
+        let private_key = self.private_key.derive_child(tweak)?;
+        Ok(ExtendedPrivateKey {
+            private_key,
+            attrs: ExtendedKeyAttrs {
+                parent_fingerprint: KeyFingerprint::default(),
+                child_number,
+                chain_code,
+                depth,
+            },
+        })
+    }
+
     /// Borrow the derived private key value.
     pub fn private_key(&self) -> &K {
         &self.private_key
