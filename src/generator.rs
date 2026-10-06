@@ -606,7 +606,7 @@ mod tests {
             .derive_children([ChildNumber::new(0, false).unwrap()].as_slice())
             .unwrap();
         let deep_batch = batch[0]
-            .derive_children(&[ChildNumber::new(5, false).unwrap()].as_slice())
+            .derive_children([ChildNumber::new(5, false).unwrap()].as_slice())
             .unwrap();
         let deep_one = master
             .derive_child(ChildNumber::new(0, false).unwrap())
