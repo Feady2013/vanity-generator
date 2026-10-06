@@ -231,24 +231,33 @@ impl Generator {
         } else {
             self.derive_batch
         };
-        for i in 0..batch {
-            // 末层子密钥：基索引 + i（保留原末层 hardened 属性）
-            let child_xprv = if self.path_cns.is_empty() {
-                xprv.clone()
-            } else {
-                let cn = ChildNumber::new(last_idx + i, last_hardened).map_err(|e| {
-                    VanityError::internal(
-                        format!("invalid BIP32 child number {:#010x}: {e}", last_idx + i),
-                        format!("非法 BIP32 子索引 {:#010x}：{e}", last_idx + i),
-                    )
-                })?;
-                xprv.derive_child(cn).map_err(|e| {
-                    VanityError::internal(
-                        format!("bip32 child derivation failed: {e}"),
-                        format!("BIP32 子密钥派生失败：{e}"),
-                    )
-                })?
-            };
+        // 末层批量派生：derive_children 摊销同父重复计算（父公钥 ×2、
+        // fingerprint、HMAC ipad/opad 状态每批一次），每 child 的 HMAC
+        // 消息与逐个 derive_child 逐字节一致（差分门禁见测试
+        // bip32_批量派生与逐个派生_bit_exact_一致 / 批派生地址序列与逐路径一致）。
+        // batch=1（默认，单助记词→单地址主用途）时同样走该路径，行为不变。
+        let child_xprvs: Vec<XPrv> = if self.path_cns.is_empty() {
+            (0..batch).map(|_| xprv.clone()).collect()
+        } else {
+            let children: Result<Vec<ChildNumber>, VanityError> = (0..batch)
+                .map(|i| {
+                    ChildNumber::new(last_idx + i, last_hardened).map_err(|e| {
+                        VanityError::internal(
+                            format!("invalid BIP32 child number {:#010x}: {e}", last_idx + i),
+                            format!("非法 BIP32 子索引 {:#010x}：{e}", last_idx + i),
+                        )
+                    })
+                })
+                .collect();
+            xprv.derive_children(&children?).map_err(|e| {
+                VanityError::internal(
+                    format!("bip32 child derivation failed: {e}"),
+                    format!("BIP32 子密钥派生失败：{e}"),
+                )
+            })?
+        };
+        for (i, child_xprv) in child_xprvs.into_iter().enumerate() {
+            let i = i as u32;
 
             // 6. 私钥范围检查 [1, n-1]：from_slice 拒绝 0 与 ≥n
             let sk = SecretKey::from_slice(child_xprv.to_bytes().as_slice()).map_err(|e| {
@@ -559,6 +568,77 @@ mod tests {
             hex::encode(h0n1.to_bytes()),
             "3c6cb8d0f6a264c91ea8b5030fadaa8e538b020f0a387421a12de9319dc93368"
         );
+    }
+
+    /// 差分门禁：vendored bip32 新增的 derive_children（批量摊销路径：
+    /// 父公钥/fingerprint/HMAC ipad-opad 每批一次）与逐个 derive_child
+    /// 必须 bit-exact 一致。覆盖非 hardened / hardened / 混合 / 大索引 /
+    /// 重复索引 / 单元素 / 空 / 深层再派生。
+    #[test]
+    fn bip32_批量派生与逐个派生_bit_exact_一致() {
+        let seed = [0x42u8; 64];
+        let master = XPrv::new(&seed).unwrap();
+        let cases: &[Vec<(u32, bool)>] = &[
+            vec![(0, false), (1, false), (2, false), (3, false), (7, false)],
+            vec![(0, true), (1, true), (2, true)],
+            vec![(0, false), (0xFF, true), (100_000_000, false), (0, false), (1, true)],
+            vec![(7, false)],
+            vec![],
+        ];
+        for seq in cases {
+            let children: Vec<ChildNumber> = seq
+                .iter()
+                .map(|&(n, h)| ChildNumber::new(n, h).unwrap())
+                .collect();
+            let batch = master.derive_children(&children).unwrap();
+            assert_eq!(batch.len(), children.len());
+            for (i, &cn) in children.iter().enumerate() {
+                let one = master.derive_child(cn).unwrap();
+                assert_eq!(
+                    batch[i].to_bytes().as_ref(),
+                    one.to_bytes().as_ref(),
+                    "child #{i} ({cn:?}) 私钥不一致"
+                );
+            }
+        }
+        // 深层再派生（确保链码/attrs 无误，同路径序列批量结果可继续正确派生）
+        let batch = master
+            .derive_children(&[ChildNumber::new(0, false).unwrap()].as_slice())
+            .unwrap();
+        let deep_batch = batch[0]
+            .derive_children(&[ChildNumber::new(5, false).unwrap()].as_slice())
+            .unwrap();
+        let deep_one = master
+            .derive_child(ChildNumber::new(0, false).unwrap())
+            .unwrap()
+            .derive_child(ChildNumber::new(5, false).unwrap())
+            .unwrap();
+        assert_eq!(deep_batch[0].to_bytes().as_ref(), deep_one.to_bytes().as_ref());
+    }
+
+    /// 端到端差分：批派生（derive_children 路径）产出的地址序列与
+    /// 逐路径单派生完全一致（同助记词、逐个索引）。
+    #[test]
+    fn 批派生地址序列与逐路径一致() {
+        let m = Matcher::new(false, None, None, None); // 全命中
+        let entropy = [0x11u8; 32];
+        // 批 4：末层 0..3 连续
+        let mut g_batch = Generator::new(24, "m/44'/60'/0'/0/0", &DEFAULT_INDICES, false)
+            .unwrap()
+            .with_derive_batch(4);
+        let (hits_batch, n) = g_batch.derive_and_match(&entropy, &m).unwrap();
+        assert_eq!(n, 4);
+        // 逐路径：i=0..3（注意 path_indices 才是实际派生层，path 仅显示用）
+        for i in 0..4u32 {
+            let indices = [0x8000_002C, 0x8000_003C, 0x8000_0000, 0, i];
+            let path = format!("m/44'/60'/0'/0/{i}");
+            let mut g = Generator::new(24, &path, &indices, false).unwrap();
+            let (hits_one, _) = g.derive_and_match(&entropy, &m).unwrap();
+            assert_eq!(
+                hits_batch[i as usize].address, hits_one[0].address,
+                "批量第 {i} 个地址与单派生不一致"
+            );
+        }
     }
 
     /// 同熵同参数必须可重现（确定性要求）

@@ -28,7 +28,7 @@ tiny-keccak = { version = "=2.0.2", features = ["keccak"] }
 # 同时去掉 bzip2 的 C 依赖 → 全依赖树纯 Rust，任意目标可交叉编译。
 # 如需切换为 sequoia 默认的 nettle（C 库，动态链接），改回 default 特性即可。
 sequoia-openpgp = { version = "=1.21.2", default-features = false, features = ["crypto-rust", "allow-experimental-crypto", "allow-variable-time-crypto"] }
-bip32 = { version = "=0.5.3", default-features = false, features = ["secp256k1", "std"] }
+bip32 = { version = "=0.5.3", default-features = false, features = ["secp256k1", "std", "alloc"] }
 
 # ===== 并行与性能 =====
 memchr = "=2.7.6"

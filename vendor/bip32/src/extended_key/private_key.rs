@@ -16,6 +16,7 @@ use zeroize::Zeroize;
 use {
     crate::DerivationPath,
     alloc::string::{String, ToString},
+    alloc::vec::Vec,
     zeroize::Zeroizing,
 };
 
@@ -111,6 +112,58 @@ where
         };
 
         Ok(ExtendedPrivateKey { private_key, attrs })
+    }
+
+    /// 批量派生子密钥：语义与对每个 child 单独调用 [`derive_child`] 完全一致
+    /// （BIP32 CKD 逐步派生，bit-exact），但摊销了同一父密钥下的重复计算——
+    ///
+    /// - 父公钥（非 hardened 消息输入 + parent_fingerprint 来源）只计算一次；
+    /// - HMAC-SHA512 的 ipad/opad 中间状态（key = 父链码）只构建一次，
+    ///   每个 child 从克隆状态继续（消息仍含独立 index）；
+    /// - parent_fingerprint / depth 对整批不变。
+    ///
+    /// 供同一助记词批量派生连续地址（BIP44 多账户）的热路径使用；
+    /// 安全性不变：每 child 的 HMAC 消息与逐个派生逐字节相同，
+    /// 椭圆曲线运算全部复用原语实现，无任何自实现密码学。
+    #[cfg(feature = "alloc")]
+    pub fn derive_children(&self, children: &[ChildNumber]) -> Result<Vec<Self>> {
+        let depth = self.attrs.depth.checked_add(1).ok_or(Error::Depth)?;
+        // 父公钥整批一次（derive_tweak 的非 hardened 输入与 fingerprint 共用）
+        let parent_public = self.private_key.public_key();
+        let parent_fingerprint = parent_public.fingerprint();
+        // HMAC 引擎整批一次（key = 父链码）；hmac::Mac 的 finalize 消费 self，
+        // 故每个 child 克隆状态（两个 SHA-512 状态，成本可忽略）
+        let base_hmac = HmacSha512::new_from_slice(&self.attrs.chain_code)
+            .map_err(|_| Error::Crypto)?;
+
+        let mut derived = Vec::with_capacity(children.len());
+        for &child_number in children {
+            let mut hmac = base_hmac.clone();
+            if child_number.is_hardened() {
+                hmac.update(&[0]);
+                hmac.update(&self.private_key.to_bytes());
+            } else {
+                hmac.update(&parent_public.to_bytes());
+            }
+            hmac.update(&child_number.to_bytes());
+
+            let result = hmac.finalize().into_bytes();
+            let (tweak_bytes, chain_code_bytes) = result.split_at(KEY_SIZE);
+            let tweak = PrivateKeyBytes::try_from(tweak_bytes)?;
+            let chain_code = chain_code_bytes.try_into()?;
+
+            let private_key = self.private_key.derive_child(tweak)?;
+            derived.push(ExtendedPrivateKey {
+                private_key,
+                attrs: ExtendedKeyAttrs {
+                    parent_fingerprint,
+                    child_number,
+                    chain_code,
+                    depth,
+                },
+            });
+        }
+        Ok(derived)
     }
 
     /// Borrow the derived private key value.
