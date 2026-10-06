@@ -577,7 +577,7 @@ mod tests {
     #[test]
     fn bip32_批量派生与逐个派生_bit_exact_一致() {
         let seed = [0x42u8; 64];
-        let master = XPrv::new(&seed).unwrap();
+        let master = XPrv::new(seed).unwrap();
         let cases: &[Vec<(u32, bool)>] = &[
             vec![(0, false), (1, false), (2, false), (3, false), (7, false)],
             vec![(0, true), (1, true), (2, true)],
@@ -603,7 +603,7 @@ mod tests {
         }
         // 深层再派生（确保链码/attrs 无误，同路径序列批量结果可继续正确派生）
         let batch = master
-            .derive_children(&[ChildNumber::new(0, false).unwrap()].as_slice())
+            .derive_children([ChildNumber::new(0, false).unwrap()].as_slice())
             .unwrap();
         let deep_batch = batch[0]
             .derive_children(&[ChildNumber::new(5, false).unwrap()].as_slice())
