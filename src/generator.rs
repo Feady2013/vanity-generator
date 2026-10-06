@@ -25,7 +25,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use bip32::{ChildNumber, XPrv};
 use bip39::{Language, Mnemonic};
 use k256::elliptic_curve::sec1::ToEncodedPoint;
-use k256::SecretKey;
+use k256::{ProjectivePoint, SecretKey};
 use rand::rngs::OsRng;
 use rand::TryRngCore;
 use tiny_keccak::{Hasher, Keccak};
@@ -272,7 +272,14 @@ impl Generator {
             })?;
 
             // 7. 公钥（未压缩 65 字节：04 || x || y，取 x||y 共 64 字节）
-            let point = sk.public_key().as_affine().to_encoded_point(false);
+            //    走 k256 预计算生成元表（30KB 静态 GEN_LOOKUP_TABLE）的
+            //    mul_by_generator：结果 = G×sk 数学恒等；较默认路径
+            //    （from_secret_scalar 的通用 GLV 乘法，每次现场构建查找表）
+            //    免除表构建与标量分解开销。
+            use k256::elliptic_curve::ops::MulByGenerator;
+            let point = ProjectivePoint::mul_by_generator(sk.to_nonzero_scalar().as_ref())
+                .to_affine()
+                .to_encoded_point(false);
             let xy = point.as_bytes().get(1..65).ok_or_else(|| {
                 VanityError::internal("unexpected SEC1 encoding length", "SEC1 编码长度异常")
             })?;

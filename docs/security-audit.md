@@ -103,3 +103,26 @@
 
 **总结论**：未发现违反上述任何规范的实现；derive_batch 与 MetaMask
 多账户模型同构，安全等价，默认关闭、显式启用。
+
+
+## 六、性能补丁密码学安全专项复核（2026-10-07，用户点名验收项）
+
+本轮 4 项修改逐项复核（红线：只用权威库 / 禁自实现原语 / OsRng 唯一
+熵源 / 禁 unsafe / 零新依赖）：
+
+| # | 修改 | 密码学性质 | 复核结论 |
+|---|---|---|---|
+| 1 | derive_children 批量摊销 | HMAC 消息与逐个派生逐字节一致（差分门禁 bit-exact）；父公钥/ipad-opad 只是消除**重复计算**，非改变计算 | ✅ 无密码学语义变化 |
+| 2 | XPrv::new 常量 midstate 直驱 | 标准 HMAC 结构组装；压缩用 bitcoin_hashes::sha512::compress_block（权威库公共原语，与 bip39 pbkdf2 直驱同模式先例）；OnceLock 缓存的是**公开常量 key**（"Bitcoin seed"）的 keyed 状态，无秘密可泄 | ✅ 差分 10 种子 bit-exact |
+| 3 | nofingerprint 变体 | BIP32 规范：parent_fingerprint 仅供 XPRV/XPUB 序列化识别父密钥，**不参与任何 CKD 计算**；程序输出（地址/助记词/path）不含中间层序列化 | ✅ 密钥/链码 bit-exact 门禁；API 命名显式传达 trade-off |
+| 4 | mul_by_generator（预计算生成元表） | 数学恒等 k×G；表为 k256 官方 precomputed-tables feature（默认启用，非我们注入）；LookupTable::select 为**常量时间**实现（库注释明示） | ✅ 纯调用方改动，零库修改 |
+
+红线全项保持：全部修改为 safe Rust（零 unsafe）；熵源 OsRng 调用链
+未触碰；Zeroizing 敏感数据擦除路径未改动；无新增第三方 crate
+（bitcoin_hashes 依赖为树内既有包，bip32→它的新边不引入新代码）；
+无秘密依赖的条件分支（匹配规则/路径均为公开配置）。
+
+差分门禁总计（常驻 CI）：pbkdf2 直驱（12/18/24 词×口令分支）、
+derive_children bit-exact、批地址序列端到端、XPrv::new 快/慢路径
+bit-exact、跳指纹 bit-exact、跳指纹端到端地址一致 + BIP32/BIP39
+官方向量锚定。
