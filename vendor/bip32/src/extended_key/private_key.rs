@@ -25,6 +25,38 @@ const BIP39_DOMAIN_SEPARATOR: [u8; 12] = [
     0x42, 0x69, 0x74, 0x63, 0x6f, 0x69, 0x6e, 0x20, 0x73, 0x65, 0x65, 0x64,
 ];
 
+/// "Bitcoin seed" 常量 key 的 HMAC-SHA512 keyed midstates（ipad/opad 吸收
+/// 后的 [u64; 8] 状态对），进程级缓存（OnceLock）。首次调用用 bitcoin_hashes
+/// 引擎做标准 HMAC keying（与 RustCrypto hmac 逐字节一致），之后每次
+/// XPrv::new 直驱复用，消除每 attempt 的 ipad/opad 压缩。
+fn bitcoin_seed_midstates() -> ([u64; 8], [u64; 8]) {
+    use bitcoin_hashes::{sha512, Hash, HashEngine};
+    use std::sync::OnceLock;
+    static MIDS: OnceLock<([u64; 8], [u64; 8])> = OnceLock::new();
+    *MIDS.get_or_init(|| {
+        let mut ipad = [0x36u8; 128];
+        let mut opad = [0x5cu8; 128];
+        for (i, b) in BIP39_DOMAIN_SEPARATOR.iter().enumerate() {
+            ipad[i] ^= *b;
+            opad[i] ^= *b;
+        }
+        let mut ie = sha512::Hash::engine();
+        ie.input(&ipad);
+        let mut oe = sha512::Hash::engine();
+        oe.input(&opad);
+        let to_u64 = |mid: [u8; 64]| {
+            let mut st = [0u64; 8];
+            for (s, c) in st.iter_mut().zip(mid.chunks(8)) {
+                let mut t = [0u8; 8];
+                t.copy_from_slice(c);
+                *s = u64::from_be_bytes(t);
+            }
+            st
+        };
+        (to_u64(ie.midstate()), to_u64(oe.midstate()))
+    })
+}
+
 /// Extended private secp256k1 ECDSA signing key.
 #[cfg(feature = "secp256k1")]
 pub type XPrv = ExtendedPrivateKey<k256::ecdsa::SigningKey>;
@@ -62,18 +94,53 @@ where
     }
 
     /// Create the root extended key for the given seed value.
+    ///
+    /// 性能补丁（保留原算法语义，BIP32 官方向量 + 差分测试锚定）：
+    /// HMAC key "Bitcoin seed" 是编译期常量，其 ipad/opad keyed
+    /// midstate 每进程只需计算一次（首次调用后进程级缓存）；64 字节
+    /// seed（BIP39 to_seed 唯一输出，热路径全覆盖）走直驱压缩——
+    /// 消息恰 64B，内/外层终块布局（0x80 填充 + BE128(1536)）与
+    /// U 迭代同构，可完全复用 vendored bip39 pbkdf2 直驱的块布局。
+    /// 其他 seed 长度（16/32B）保持原 RustCrypto hmac 引擎路径。
     pub fn new<S>(seed: S) -> Result<Self>
     where
         S: AsRef<[u8]>,
     {
-        if ![16, 32, 64].contains(&seed.as_ref().len()) {
+        let seed = seed.as_ref();
+        if ![16, 32, 64].contains(&seed.len()) {
             return Err(Error::SeedLength);
         }
 
-        let mut hmac = HmacSha512::new_from_slice(&BIP39_DOMAIN_SEPARATOR)?;
-        hmac.update(seed.as_ref());
-
-        let result = hmac.finalize().into_bytes();
+        let result: [u8; 64] = if seed.len() == KEY_SIZE * 2 {
+            // 快路径：常量 midstate 直驱（每 attempt 省 2 次 compress）
+            let (si, so) = bitcoin_seed_midstates();
+            // 消息总长 = 128(ipad 块) + 64(seed) = 192B = 1536 bit
+            let mut block = [0u8; 128];
+            block[..64].copy_from_slice(seed);
+            block[64] = 0x80;
+            block[126] = 0x06; // 1536 = 0x0600 → BE128 高字节
+            block[127] = 0x00;
+            let mut st = si;
+            bitcoin_hashes::sha512::compress_block(&mut st, &block);
+            // 外层终块：BE(内层摘要)(64) || 常量尾
+            for (c8, v) in block[..64].chunks_mut(8).zip(st.iter()) {
+                c8.copy_from_slice(&v.to_be_bytes());
+            }
+            let mut st2 = so;
+            bitcoin_hashes::sha512::compress_block(&mut st2, &block);
+            let mut out = [0u8; 64];
+            for (c8, v) in out.chunks_mut(8).zip(st2.iter()) {
+                c8.copy_from_slice(&v.to_be_bytes());
+            }
+            out
+        } else {
+            let mut hmac = HmacSha512::new_from_slice(&BIP39_DOMAIN_SEPARATOR)?;
+            hmac.update(seed);
+            let out = hmac.finalize().into_bytes();
+            let mut arr = [0u8; 64];
+            arr.copy_from_slice(&out);
+            arr
+        };
         let (secret_key, chain_code) = result.split_at(KEY_SIZE);
         let private_key = PrivateKey::from_bytes(secret_key.try_into()?)?;
         let attrs = ExtendedKeyAttrs {

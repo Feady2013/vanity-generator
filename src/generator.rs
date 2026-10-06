@@ -570,6 +570,70 @@ mod tests {
         );
     }
 
+    /// XPrv::new 直驱差分门禁：64B seed（BIP39 to_seed 唯一输出，热路径
+    /// 全覆盖）的常量 midstate 快路径 vs RustCrypto 原引擎 HMAC，私钥与
+    /// 链码必须 bit-exact。种子含边界值与确定性伪随机序列。
+    #[test]
+    fn xprv_new_64b_快路径与原引擎_bit_exact() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512Rc = Hmac<Sha512>;
+
+        // 构造测试种子集：全 0 / 全 ff / xorshift 确定性序列
+        let mut seeds: Vec<[u8; 64]> = vec![[0u8; 64], [0xffu8; 64]];
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..8 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let mut seed = [0u8; 64];
+            for c in seed.chunks_mut(8) {
+                let y = x.wrapping_mul(0x2545F4914F6CDD1D).rotate_left(17);
+                c.copy_from_slice(&y.to_le_bytes());
+                x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            }
+            seeds.push(seed);
+        }
+
+        for seed in &seeds {
+            // 快路径（直驱）
+            let xprv = XPrv::new(seed).unwrap();
+            // 对照：RustCrypto 原引擎（与 BIP32 规范一致的标准 HMAC）
+            let mut mac = HmacSha512Rc::new_from_slice(b"Bitcoin seed").unwrap();
+            mac.update(seed);
+            let out = mac.finalize().into_bytes();
+            let key: Vec<u8> = AsRef::<[u8]>::as_ref(&xprv.private_key().to_bytes()).to_vec();
+            let chain: Vec<u8> = AsRef::<[u8]>::as_ref(&xprv.attrs().chain_code).to_vec();
+            assert_eq!(key, out[..32].to_vec(), "私钥不一致：seed={}", hex::encode(seed));
+            assert_eq!(chain, out[32..64].to_vec(), "链码不一致：seed={}", hex::encode(seed));
+        }
+    }
+
+    /// XPrv::new 非 64B seed（16/32B，fallback 原引擎路径）回归：
+    /// 与手工 HMAC 一致，且官方 BIP32 向量 1（16B）继续锚定。
+    #[test]
+    fn xprv_new_短种子_fallback与原引擎_bit_exact() {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha512;
+        type HmacSha512Rc = Hmac<Sha512>;
+
+        let seeds: [&[u8]; 3] = [
+            &hex::decode("000102030405060708090a0b0c0d0e0f").unwrap(), // 官方向量 1
+            &[0x42u8; 16],
+            &[0x42u8; 32],
+        ];
+        for seed in seeds {
+            let xprv = XPrv::new(seed).unwrap();
+            let mut mac = HmacSha512Rc::new_from_slice(b"Bitcoin seed").unwrap();
+            mac.update(seed);
+            let out = mac.finalize().into_bytes();
+            let key: Vec<u8> = AsRef::<[u8]>::as_ref(&xprv.private_key().to_bytes()).to_vec();
+            let chain: Vec<u8> = AsRef::<[u8]>::as_ref(&xprv.attrs().chain_code).to_vec();
+            assert_eq!(key, out[..32].to_vec());
+            assert_eq!(chain, out[32..64].to_vec());
+        }
+    }
+
     /// 差分门禁：vendored bip32 新增的 derive_children（批量摊销路径：
     /// 父公钥/fingerprint/HMAC ipad-opad 每批一次）与逐个 derive_child
     /// 必须 bit-exact 一致。覆盖非 hardened / hardened / 混合 / 大索引 /
