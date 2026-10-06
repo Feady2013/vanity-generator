@@ -132,3 +132,29 @@ derive_batch 之前）vs 当前 HEAD 的单线程速率，并测 derive_batch=8 
 单路径性能地板声明：~1.9ms/attempt 为 BIP39 协议锁定的 4096 次
 SHA-512 压缩（77%），软件层面已无安全优化空间；批量场景请用
 `derive_batch`（5.7×），生产叠加 PGO。
+
+
+## 9. 优化点全面盘点与逐项实施（2026-10-07，用户主用途=单路径 m/44'/60'/0'/0/0）
+
+### 已实施（本节）
+| # | 项 | 收益（实测/推算） | 状态 |
+|---|---|---|---|
+| 1 | derive_children：消除 derive_child 同父双重父公钥乘（tweak 输入+fingerprint 各算一次 k256 乘） | 单路径 +2×乘法消除（噪声内）、批模式显著（CI bench 量化中）；bit-exact 差分门禁 2 项 | ✅ ce370f7 |
+
+### 量化后拒绝（改动/风险 > 收益）
+| 项 | 量化 | 拒绝理由 |
+|---|---|---|
+| pbkdf2 ipad/opad 预计算 | 0 | **HMAC key=助记词（每 attempt 变）**，非空口令——读码后推翻假设，协议本质不可缓存 |
+| XPrv::new "Bitcoin seed" 常量 midstate 直驱 | +0.02%（省 2 compress/attempt） | 见 §10：已实施 |
+| 中间层 fingerprint 豁免（parent_fingerprint 仅序列化消费） | +0.14% | attrs.parent_fingerprint 是公开数据语义，填假值破坏 bit-exact；序列化路径将输出错误 |
+| 批模式 Montgomery batch inversion（N 点共享 1 次模逆） | 批模式 ~+2% | 需收集整批 projective 点改 k256 输出流程；主用途单路径无批可逆 |
+| OsRng 批量/缓存 | — | 密码学红线：OsRng 唯一熵源，禁缓存/预测 |
+| fingerprint 的 SHA256+RIPEMD | 0.14%/层 | RustCrypto 已最优；无法跳过（语义） |
+| target-cpu=x86-64-v2 | ~0 | SHA-512 无对应 SIMD 加速（SHA-NI 仅 SHA-256），发布兼容性优先 |
+| derive_tweak HMAC 引擎重建 | 不可缓存 | key=父链码每 attempt 变 |
+| child_xprvs Vec（batch=1 时 1 元素堆分配） | 0.001% | SmallVec 需新依赖（红线） |
+
+### 单路径成本地板（重申）
+每 attempt ~2.155ms：pbkdf2 4096 compress ≈1.78ms（82%，协议锁定）+
+bip32 链 5 层 + k256 乘 ×(3-8 次) + keccak + 杂项。软件侧全部可做的
+摊销/消除项已做完；剩余项合计 <0.2% 且多为协议/语义锁定。
