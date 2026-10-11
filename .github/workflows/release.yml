@@ -34,7 +34,7 @@ jobs:
       - name: 快照既有 Release 元数据到 Summary
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        TAG: ${{ steps.resolve.outputs.tag }}
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
           # GitHub 平台行为：删除/强推已有 Release 的 tag 会连带删除该
           # Release（发生在本工作流启动前，无法阻止）。此步把既有
