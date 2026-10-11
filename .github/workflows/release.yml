@@ -1,61 +1,131 @@
 name: Release
 
+# 发布模式（2026-10-11 重构）：默认走 workflow_dispatch——五平台构建
+# 全部成功后，才在 publish（整理发布）阶段创建 tag 与 Release。
+# 构建失败则零残留（无 tag / 无 Release / 无半成品）。
+# 重复发布同一版本 = 幂等补传（覆盖同名资产），永不删除既有 Release。
+# 兼容保留 push tag 触发（老习惯可用）；若该 tag 的 Release 已存在则
+# 自动跳过，避免双跑与误覆盖。
+
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
-      tag:
-        description: "要（重新）发布的 tag（必须已存在且指向目标 commit）"
-        required: true
+      version:
+        description: "版本号（v0.x.y；留空则自动读 Cargo.toml 的 version 加 v 前缀）"
+        required: false
         type: string
+      commit:
+        description: "要发布的 commit（留空 = 当前 ref 的 HEAD）"
+        required: false
+        type: string
+      force:
+        description: "true = 同版本强制重建并覆盖资产"
+        required: false
+        type: boolean
+        default: false
+  push:
+    tags: ["v*"]
 
 permissions:
   contents: write
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  snapshot:
-    name: 既有 Release 快照（重推 tag 防丢失审计）
+  plan:
+    name: 发布计划（解析版本 / 幂等判定）
     runs-on: ubuntu-latest
     outputs:
-      tag: ${{ steps.resolve.outputs.tag }}
+      tag: ${{ steps.plan.outputs.tag }}
+      sha: ${{ steps.plan.outputs.sha }}
+      should_build: ${{ steps.plan.outputs.should_build }}
+      reason: ${{ steps.plan.outputs.reason }}
     steps:
-      - name: 解析目标 tag
-        id: resolve
+      - name: 检出目标 commit
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.commit || github.sha }}
+          fetch-depth: 0
+
+      - name: 制定发布计划
+        id: plan
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ inputs.tag || github.ref_name }}"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "本次发布目标 tag：$TAG"
-      - name: 快照既有 Release 元数据到 Summary
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.resolve.outputs.tag }}
-        run: |
-          # GitHub 平台行为：删除/强推已有 Release 的 tag 会连带删除该
-          # Release（发生在本工作流启动前，无法阻止）。此步把既有
-          # Release 的 notes/assets 清单快照进 Summary，保证即使被平台
-          # 删除也可追溯，随后 create/upload 幂等重建。
-          if gh release view "$TAG" > /tmp/rel.json 2>/dev/null; then
-            {
-              echo "## 既有 Release 快照（$TAG）"
-              echo '```'
-              gh release view "$TAG" --json body,assets,createdAt \
-                --jq '{createdAt, body, assets: [.assets[].name]}' 2>/dev/null || cat /tmp/rel.json
-              echo '```'
-            } >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          SHA="$(git rev-parse HEAD)"
+          echo "目标 commit：$SHA"
+
+          # ── 版本解析：dispatch 输入优先，缺省读 Cargo.toml ──
+          if [ -n "${{ inputs.version || '' }}" ]; then
+            TAG="${{ inputs.version }}"
+          elif [ -n "${GITHUB_REF_TYPE:-}" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG="$GITHUB_REF_NAME"
           else
-            echo "Release $TAG 不存在（新建，或已被 tag 重推连带删除——见仓库 Events 审计）" >> "$GITHUB_STEP_SUMMARY"
+            CARGO_VER="$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+            TAG="v$CARGO_VER"
+          fi
+          case "$TAG" in
+            v[0-9]*) : ;;
+            *) echo "::error::版本号格式应为 v0.x.y，收到：$TAG"; exit 1 ;;
+          esac
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "目标版本：$TAG"
+
+          # ── 幂等判定 ──
+          TAG_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" --jq .object.sha 2>/dev/null || true)"
+          REL_ASSETS="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '[.assets[].name] | length' 2>/dev/null || echo -1)"
+
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            # 手动打 tag 触发（兼容路径）：Release 已存在 → 自动跳过防双跑
+            if [ "$REL_ASSETS" -ge 0 ] 2>/dev/null; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "reason=tag 触发但 Release $TAG 已存在（$REL_ASSETS 资产）——为防双跑与误覆盖已跳过；如需重建请用 workflow_dispatch 勾选 force" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # tag 指向必须就是本次触发 commit
+            if [ -n "$TAG_SHA" ] && [ "$TAG_SHA" != "$SHA" ]; then
+              echo "::error::tag $TAG 指向 $TAG_SHA，与触发 commit $SHA 不一致"; exit 1
+            fi
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            echo "reason=push tag 触发（兼容路径），构建后创建 Release" >> "$GITHUB_OUTPUT"
+          else
+            # workflow_dispatch（推荐路径）
+            if [ -n "$TAG_SHA" ] && [ "$TAG_SHA" != "$SHA" ]; then
+              echo "::error::tag $TAG 已存在且指向 $TAG_SHA（≠本次构建 $SHA）。重新发布请提升版本号（新 tag），或改用 commit 输入匹配既有 tag"
+              exit 1
+            fi
+            if [ "$REL_ASSETS" -ge 5 ] 2>/dev/null && [ "${{ inputs.force }}" != "true" ]; then
+              echo "should_build=false" >> "$GITHUB_OUTPUT"
+              echo "reason=Release $TAG 已存在且资产完整（$REL_ASSETS）——幂等跳过；勾选 force 可强制重建覆盖" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            if [ "$REL_ASSETS" -ge 0 ] 2>/dev/null; then
+              # 既有 Release 快照进 Summary（可追溯审计）
+              echo "reason=Release $TAG 已存在（$REL_ASSETS 资产）→ 幂等补传模式" >> "$GITHUB_OUTPUT"
+              {
+                echo "## 既有 Release 快照（$TAG）"
+                echo '```'
+                gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '{createdAt: .created_at, body, assets: [.assets[].name]}'
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY" || true
+            else
+              echo "reason=全新发布：构建全绿后将在 publish 阶段创建 tag $TAG 与 Release" >> "$GITHUB_OUTPUT"
+            fi
           fi
 
   build:
     name: 构建 (${{ matrix.target }})
+    needs: plan
+    if: needs.plan.outputs.should_build == 'true'
     runs-on: ${{ matrix.os }}
-    needs: snapshot
     strategy:
       fail-fast: false
       matrix:
@@ -76,7 +146,10 @@ jobs:
             target: x86_64-apple-darwin
             archive: tar.gz
     steps:
-      - uses: actions/checkout@v4
+      - name: 检出目标 commit（与 plan 一致）
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
 
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
@@ -98,7 +171,6 @@ jobs:
             printf '\n[target.aarch64-unknown-linux-musl]\nlinker = "aarch64-linux-gnu-gcc"\n' >> .cargo/config.toml
           fi
 
-
       - name: 缓存依赖
         uses: Swatinem/rust-cache@v2
         with:
@@ -111,7 +183,7 @@ jobs:
         if: matrix.archive == 'tar.gz'
         shell: bash
         env:
-          TAG: ${{ needs.snapshot.outputs.tag }}
+          TAG: ${{ needs.plan.outputs.tag }}
         run: |
           DIR="vanity-generator-${TAG}-${{ matrix.target }}"
           mkdir -p "$DIR"
@@ -123,23 +195,85 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $dir = "vanity-generator-${{ needs.snapshot.outputs.tag }}-${{ matrix.target }}"
+          $dir = "vanity-generator-${{ needs.plan.outputs.tag }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/vanity-generator.exe" $dir
           Copy-Item config.example.yaml $dir
           Copy-Item README.md $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
 
-      - name: 上传到 Release（幂等：不删既有，只补/覆盖同名资产）
-        shell: bash
+      - name: 上传构建产物（artifact）
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-${{ matrix.target }}
+          path: vanity-generator-${{ needs.plan.outputs.tag }}-*.${{ matrix.archive }}
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    name: 整理发布（构建全绿后才创建 tag 与 Release）
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: 下载全部构建产物
+        uses: actions/download-artifact@v4
+        with:
+          path: pkgs
+          merge-multiple: true
+
+      - name: 产物清点
+        run: |
+          ls -la pkgs/
+          COUNT=$(ls pkgs/vanity-generator-* | wc -l)
+          echo "资产数：$COUNT（应为 5）"
+          [ "$COUNT" -eq 5 ] || { echo "::error::资产数 $COUNT ≠ 5，拒绝发布"; exit 1; }
+
+      - name: 创建 tag（此步之前任何阶段都不产生 tag）
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ needs.snapshot.outputs.tag }}
+          TAG: ${{ needs.plan.outputs.tag }}
+          SHA: ${{ needs.plan.outputs.sha }}
         run: |
-          # 幂等发布：create 失败（已存在）不视为错误；--clobber 仅覆盖
-          # 同名资产，绝不删除其他 Release 或其他资产。
-          gh release create "$TAG" --title "$TAG" \
-            --notes "以太坊靓号地址生成器 $TAG（多平台预编译二进制，详见 README）" --verify-tag || true
-          gh release upload "$TAG" vanity-generator-*.${{ matrix.archive }} --clobber
-          # 兜底：确保最终为已发布状态（tag 重推后可能残留 draft）
+          # 仅当 tag 不存在时创建（重复发布同版本 → 幂等跳过）
+          if ! gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" > /dev/null 2>&1; then
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="$SHA"
+            echo "已创建 tag $TAG → $SHA"
+          else
+            echo "tag $TAG 已存在（幂等补传模式）"
+          fi
+
+      - name: 创建 Release 并上传资产（幂等：仅覆盖同名，绝不删除）
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          gh release create "$TAG" --title "$TAG" --verify-tag \
+            --notes "以太坊靓号地址生成器 $TAG（多平台预编译二进制，详见 README）" || true
+          gh release upload "$TAG" pkgs/vanity-generator-* --clobber
+          # 兜底：确保最终为已发布状态
           gh release edit "$TAG" --draft=false || true
+
+      - name: 发布摘要
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+          SHA: ${{ needs.plan.outputs.sha }}
+        run: |
+          {
+            echo "## 发布完成：$TAG"
+            echo ""
+            echo "- commit：\`$SHA\`"
+            echo "- 资产：5 平台（linux x86_64/aarch64 musl、windows x86_64、macos aarch64/x86_64）"
+            echo "- 仓库事件流含全部 Release 审计记录（DeleteEvent 带操作者）"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  skipped:
+    name: 幂等跳过说明
+    needs: plan
+    if: needs.plan.outputs.should_build != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: 说明
+        env:
+          REASON: ${{ needs.plan.outputs.reason }}
+        run: echo "$REASON"
