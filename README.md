@@ -267,6 +267,19 @@ docker run --rm --network none -v ./config:/config \
    全并行零延迟；目标数较少时按"单机预计完成时长 ×2.5（上限 45 秒）"
    错峰——该情形总时长本就只有秒级～分钟级，后启机器达标即跳过，
    总命中可精确停在目标数量
+### 版本发布与重新发布规范（重要）
+
+- **发新版本一律打新 tag**（如 `v0.1.1`、`v0.2.0`），Release 工作流自动构建五平台并幂等发布
+  （已存在的 Release 只补充/覆盖同名资产，**绝不删除既有 Release**）。
+- **不要删除/强推已发布的 tag**：GitHub 平台行为是"删除 tag 会连带删除其关联 Release"
+  （强推 tag 同理，且发生在我方工作流启动之前，无法拦截）。重推 tag 后旧 Release 的
+  notes 与下载统计将不可恢复，需要重新上传全部资产。
+- 如确需在**同一 tag** 上重新发布（例如修正构建产物）：Release 工作流已支持
+  `workflow_dispatch` 手动触发（输入目标 tag），走幂等路径补传资产，不影响其他 Release；
+  运行开始时会把既有 Release 的 notes/资产清单快照到运行 Summary，便于审计追溯。
+- 仓库事件流（`GET /repos/{owner}/{repo}/events`）保留全部 Release 删除审计记录
+  （DeleteEvent 带操作者与时间）。
+
 4. 演示产物发布在固定的**预发布 Release `demo-latest`**（prerelease，
    不占用 Latest），只复用这一个标签，不随运行次数堆积标签；
    各机器运行日志作为附件（log-machine-*.log）一并发布

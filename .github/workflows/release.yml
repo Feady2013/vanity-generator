@@ -3,6 +3,12 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要（重新）发布的 tag（必须已存在且指向目标 commit）"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -11,9 +17,45 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  snapshot:
+    name: 既有 Release 快照（重推 tag 防丢失审计）
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+    steps:
+      - name: 解析目标 tag
+        id: resolve
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "本次发布目标 tag：$TAG"
+      - name: 快照既有 Release 元数据到 Summary
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        TAG: ${{ steps.resolve.outputs.tag }}
+        run: |
+          # GitHub 平台行为：删除/强推已有 Release 的 tag 会连带删除该
+          # Release（发生在本工作流启动前，无法阻止）。此步把既有
+          # Release 的 notes/assets 清单快照进 Summary，保证即使被平台
+          # 删除也可追溯，随后 create/upload 幂等重建。
+          if gh release view "$TAG" > /tmp/rel.json 2>/dev/null; then
+            {
+              echo "## 既有 Release 快照（$TAG）"
+              echo '```'
+              gh release view "$TAG" --json body,assets,createdAt \
+                --jq '{createdAt, body, assets: [.assets[].name]}' 2>/dev/null || cat /tmp/rel.json
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "Release $TAG 不存在（新建，或已被 tag 重推连带删除——见仓库 Events 审计）" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   build:
     name: 构建 (${{ matrix.target }})
     runs-on: ${{ matrix.os }}
+    needs: snapshot
     strategy:
       fail-fast: false
       matrix:
@@ -68,8 +110,10 @@ jobs:
       - name: 打包（Unix）
         if: matrix.archive == 'tar.gz'
         shell: bash
+        env:
+          TAG: ${{ needs.snapshot.outputs.tag }}
         run: |
-          DIR="vanity-generator-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          DIR="vanity-generator-${TAG}-${{ matrix.target }}"
           mkdir -p "$DIR"
           cp "target/${{ matrix.target }}/release/vanity-generator" "$DIR/"
           cp config.example.yaml README.md "$DIR/"
@@ -79,18 +123,23 @@ jobs:
         if: matrix.archive == 'zip'
         shell: pwsh
         run: |
-          $dir = "vanity-generator-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          $dir = "vanity-generator-${{ needs.snapshot.outputs.tag }}-${{ matrix.target }}"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
           Copy-Item "target/${{ matrix.target }}/release/vanity-generator.exe" $dir
           Copy-Item config.example.yaml $dir
           Copy-Item README.md $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip"
 
-      - name: 上传到 Release
+      - name: 上传到 Release（幂等：不删既有，只补/覆盖同名资产）
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ needs.snapshot.outputs.tag }}
         run: |
-          gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" \
-            --notes "以太坊靓号地址生成器 $GITHUB_REF_NAME（多平台预编译二进制，详见 README）" || true
-          gh release upload "$GITHUB_REF_NAME" vanity-generator-*.${{ matrix.archive }} --clobber
+          # 幂等发布：create 失败（已存在）不视为错误；--clobber 仅覆盖
+          # 同名资产，绝不删除其他 Release 或其他资产。
+          gh release create "$TAG" --title "$TAG" \
+            --notes "以太坊靓号地址生成器 $TAG（多平台预编译二进制，详见 README）" --verify-tag || true
+          gh release upload "$TAG" vanity-generator-*.${{ matrix.archive }} --clobber
+          # 兜底：确保最终为已发布状态（tag 重推后可能残留 draft）
+          gh release edit "$TAG" --draft=false || true
