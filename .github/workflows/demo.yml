@@ -165,9 +165,12 @@ jobs:
           }
 
           start=$SECONDS
+          HARD=$(( TM * 60 + 30 ))   # 循环硬超时保险（时限 + 30s 收尾余量）
 
           # 达标即可直接跳过搜索（晚到机器快速通道）
-          if [ "$(hits_global)" -ge "$TARGET" ]; then
+          G0=$(hits_global)
+          echo "[启动] 全局计数 $G0/$TARGET，本机时限 ${TM} 分钟（硬超时 ${HARD}s）"
+          if [ "$G0" -ge "$TARGET" ]; then
             echo "共同目标已由先启机器完成，本机无需搜索"
             exit 0
           fi
@@ -188,7 +191,9 @@ jobs:
           BIN=$!
           killed=0
           prev_line=""
-          while kill -0 "$BIN" 2>/dev/null; do
+          # 循环双保险退出：进程退出 / 达标 / 时限 / 硬超时
+          while kill -0 "$BIN" 2>/dev/null \
+                && [ $(( SECONDS - start )) -lt "$HARD" ]; do
             scan_new_hits
             # 进度行实时透传（仅变化时打印）
             last_line=$(tail -n 1 run.log 2>/dev/null || true)
@@ -197,6 +202,8 @@ jobs:
               prev_line="$last_line"
             fi
             G=$(hits_global)
+            # 每轮心跳：可观测性保证（无命中/无进度时也能看到活着）
+            echo "[心跳] ${SECONDS}s（本机已运行 $(( SECONDS - start ))s）全局 $G/$TARGET"
             if [ "$G" -ge "$TARGET" ]; then
               echo "共同目标达成（全局 $G/$TARGET），本机提前停止"
               killed=1; kill "$BIN"; break
@@ -211,6 +218,7 @@ jobs:
             [ "$N" -gt 10 ] && [ $(( SECONDS - start )) -ge 60 ] && SLEEP=12
             sleep "$SLEEP"
           done
+          [ $(( SECONDS - start )) -ge "$HARD" ] && echo "::warning::触发硬超时保险退出"
           # GitHub 的 bash 默认 -e：被 kill 的进程 wait 返回 143，需 || 捕获
           RC=0
           wait "$BIN" 2>/dev/null || RC=$?
