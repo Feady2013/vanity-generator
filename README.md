@@ -283,13 +283,15 @@ docker run --rm --network none -v ./config:/config \
 - 仓库事件流（`GET /repos/{owner}/{repo}/events`）保留全部 Release
   删除审计记录（DeleteEvent 带操作者与时间）。
 
-4. 演示产物发布在固定的**预发布 Release `demo-latest`**（prerelease，
-   不占用 Latest），只复用这一个标签，不随运行次数堆积标签；
-   各机器运行日志作为附件（log-machine-*.log）一并发布
-
-注意：规则难度请控制在演示时限内可完成的范围（启动日志会打印"期望尝试"一行，
-也可以先在本地用 `--check` 预估）。参考：单机约 450 次/秒，8 台机器并行时
-4 位前缀（期望 6.5 万次）秒级完成，5 位（约 100 万次）数分钟，6 位起建议大幅延长时间。
+4. **演示发布形态（v6，2026-10-11 重构）**：每场演示对应独立标签
+   `demo-run-{N}`（N = 运行编号），**仅在整理发布阶段、且确有命中时才
+   创建** tag 与 Release（零命中零残留）；预发布（prerelease）不占用
+   Latest。机器间通过 commit status 共享全局命中计数（达标即停不变），
+   产物经 artifact 汇总后统一上传。
+5. **演示历史一键清理**：Actions → 清理演示 Release（demo-run-*）→
+   保留最近 N 场（默认 5），支持 dry_run 预览；仅触碰 `demo-run-*` 前缀，
+   绝不影响版本 tag 与 Release；`remove_legacy` 可选删除废弃的
+   `demo-latest` 固定标签（v6 起不再使用）。
 
 ## 常见问题
 

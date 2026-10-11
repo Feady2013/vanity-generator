@@ -1,40 +1,40 @@
 name: 靓号演示（多机并行·共同目标）
 
-# 定时 + 手动触发的多机并行演示（v5）：
+# 定时 + 手动触发的多机并行演示（v6，2026-10-11 合并 fork 定制）：
 #
-# - 编译前移：setup 任务统一编译并上传二进制工件，matrix 机器直接下载
-#   运行（省去每台 3-5 分钟的重复编译）
-# - 共同目标：以 demo-latest Release 资产为全局命中计数器，每机命中即刻
-#   上报，全部机器轮询全局命中数，达标即停止本机
-# - 全力并行：机器启动即开搜（无错峰），在途超额命中保留（检测延迟
-#   内的自然超产，通常 ≤ 机器数）
-# - API 防挂起：轮询的 gh api 均带 timeout 15s，杜绝网络挂起卡死循环
-# - 零命中不发布：未命中任何地址时删除演示 Release（不发布空产物）
-# - 发布形态：固定 prerelease 标签 demo-latest（不占 Latest、不堆积标签）
-# - 定时执行：每小时整点触发一次（UTC），每次 20 台机器并行、每台搜索 35 分钟
-
+# - 定时执行：每小时整点触发一次（cron 为 UTC），默认 20 台并行、
+#   每台搜索 35 分钟；schedule 触发时 inputs 为空，走默认兜底值
+# - 一个运行一个 tag：TAG = demo-run-{运行编号}，仅在整理发布阶段、
+#   且确有命中产物时才创建 tag 与 Release（未产出则零残留）
+# - 共同目标：以 commit status（demo-run-N/hit/m{i}/{j}）为全局命中
+#   计数器，每机命中即刻上报，全部机器轮询，达标即停止本机
+# - 全力并行：机器启动即开搜（无错峰），在途超额命中保留
+# - API 防挂起：轮询的 gh api 均带 timeout，杜绝网络挂起卡死循环
+# - 隔离保证：只创建/操作 demo-run-* 前缀的 tag 与 Release，
+#   绝不触碰版本 tag（v*）、v0.x Release 或任何既有发布
+# - 历史清理：cleanup-demo-releases.yml 一键保留最近 N 场
 on:
   schedule:
-    # ★ 改动 1：每小时整点执行一次（cron 为 UTC 时间）
+    # 每小时整点执行一次（GitHub Actions 的 cron 一律 UTC）
     - cron: '0 * * * *'
   workflow_dispatch:
     inputs:
       machines:
         description: 并行机器数（1-20）
         required: false
-        default: "20"          # ★ 改动 2：默认 20 台
+        default: "20"
       timeout_minutes:
         description: 每台机器的搜索时限（分钟）
         required: false
-        default: "35"          # ★ 改动 3：默认 35 分钟
-
-# ★ 改动 4：并发组——上一轮若未结束，下一轮排队而非取消/堆积
-concurrency:
-  group: demo-hourly
-  cancel-in-progress: false
+        default: "35"
 
 permissions:
   contents: write
+  statuses: write
+
+concurrency:
+  group: demo-run
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,6 +47,8 @@ jobs:
       count: ${{ steps.cfg.outputs.count }}
       matrix: ${{ steps.gen.outputs.matrix }}
       machines: ${{ steps.gen.outputs.machines }}
+      tag: ${{ steps.meta.outputs.tag }}
+      sha: ${{ steps.meta.outputs.sha }}
     steps:
       - name: 检查 Secrets 是否已配置
         env:
@@ -77,9 +79,7 @@ jobs:
           echo "count=$COUNT" >> "$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
-
       - uses: dtolnay/rust-toolchain@stable
-
       - name: 缓存依赖
         uses: Swatinem/rust-cache@v2
 
@@ -93,13 +93,19 @@ jobs:
           path: target/release/vanity-generator
           retention-days: 1
 
-      - name: 生成矩阵并初始化演示 Release
-        id: gen
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
+      - name: 本场标识（tag 计划：有产出才在发布阶段创建）
+        id: meta
         run: |
-          N=${{ inputs.machines || '20' }}          # ★ 改动 5：schedule 触发时 inputs 为空，兜底值由 8 改为 20
+          TAG="demo-run-${GITHUB_RUN_NUMBER}"
+          SHA="$(git rev-parse HEAD)"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+          echo "本场标识：$TAG → $SHA（tag 将在整理发布阶段、且确有命中时才创建）"
+
+      - name: 生成矩阵
+        id: gen
+        run: |
+          N=${{ inputs.machines || '20' }}
           if ! [ "$N" -ge 1 ] 2>/dev/null; then N=1; fi
           if [ "$N" -gt 20 ]; then N=20; fi
           MATRIX=$(seq 1 "$N" | sed 's/^/"/;s/$/"/' | paste -sd, - | sed 's/^/[/;s/$/]/')
@@ -107,22 +113,13 @@ jobs:
           echo "matrix=$MATRIX" >> "$GITHUB_OUTPUT"
           echo "machines=$N" >> "$GITHUB_OUTPUT"
 
-          # 全力并行：机器启动即开搜（无错峰延迟）
-          # 固定单一 prerelease 标签 demo-latest：不存在则创建，存在则清空旧资产（全局计数归零）
-          if ! gh release view demo-latest > /dev/null 2>&1; then
-            gh release create demo-latest --prerelease --title "靓号演示（多机并行）" --notes "初始化（自动创建）" || true
-          fi
-          for AID in $(gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" --jq '.assets[].id' 2>/dev/null); do
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$AID" || true
-          done
-
   search:
     name: 搜索 (${{ matrix.machine }}/${{ needs.setup.outputs.machines }})
     needs: setup
     runs-on: ubuntu-latest
     # 任务级硬超时（分钟）：搜索时限 ≤35 + 下载/上报余量（GitHub 表达式
     # 不支持算术，取保守上界；循环内的精确时限以 TM 为准）
-    timeout-minutes: 55          # ★ 改动 6：由 40 → 55（35 分钟搜索 + 约 20 分钟余量）
+    timeout-minutes: 55
     strategy:
       fail-fast: false
       matrix:
@@ -143,57 +140,76 @@ jobs:
           VANITY_GPG_KEY: ${{ secrets.gpg }}
           TARGET: ${{ needs.setup.outputs.count }}
           MACHINE: ${{ matrix.machine }}
+          RUN_TAG: ${{ needs.setup.outputs.tag }}
+          SHA: ${{ needs.setup.outputs.sha }}
         run: |
           set -u
           chmod +x ./vanity-generator
           M="$MACHINE"
           TARGET="$TARGET"
-          TM=${{ inputs.timeout_minutes || '35' }}   # ★ 改动 7：兜底值由 15 改为 35
+          TM=${{ inputs.timeout_minutes || '35' }}
           N=${{ needs.setup.outputs.machines }}
+          CTX_BASE="$RUN_TAG/hit"
           echo "机器 $M/$N：共同目标 $TARGET 个地址，时限 ${TM} 分钟，全力并行"
           mkdir -p /tmp/out
 
-          hits_on_release() {
-            timeout 15 gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
-              --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo -1
+          # ── 全局命中计数器：commit status（原子创建，无跨机写竞态）──
+          hits_global() {
+            timeout 15 gh api "repos/$GITHUB_REPOSITORY/commits/$SHA/statuses?per_page=100" \
+              --jq "[.[] | select(.context | startswith(\"$CTX_BASE\"))] | length" 2>/dev/null || echo -1
           }
 
-          # 时限计时（下载完成即开始）
+          # 上报一个命中（先存文件、后报计数：顺序保证计数 ≤ 实际产物）
+          report_hit() {
+            local f="$1" i="$2"
+            mkdir -p hits
+            cp "$f" "hits/m${M}-$(basename "$f")"
+            timeout 15 gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA" \
+              -f state=success -f context="$CTX_BASE/m${M}/$i" \
+              -f description="机器 $M 第 $i 个命中" > /dev/null 2>&1 || true
+            echo "已上报命中：m${M}-$(basename "$f")（全局计数 $(( $(hits_global) ))/$TARGET）"
+          }
+
           start=$SECONDS
+          HARD=$(( TM * 60 + 30 ))   # 循环硬超时保险（时限 + 30s 收尾余量）
 
           # 达标即可直接跳过搜索（晚到机器快速通道）
-          if [ "$(hits_on_release)" -ge "$TARGET" ]; then
+          G0=$(hits_global)
+          echo "[启动] 全局计数 $G0/$TARGET，本机时限 ${TM} 分钟（硬超时 ${HARD}s）"
+          if [ "$G0" -ge "$TARGET" ]; then
             echo "共同目标已由先启机器完成，本机无需搜索"
             exit 0
           fi
 
-          upload_new_hits() {
+          # 扫描新命中 → 上报（本机序号自增，context 唯一）
+          scanned=""
+          mine=0
+          scan_new_hits() {
             for f in vanity_*.asc; do
               [ -f "$f" ] || continue
-              case " $uploaded " in *" $f "*) continue ;; esac
-              staged="/tmp/out/m${M}-$(basename "$f")"
-              if cp "$f" "$staged" && timeout 30 gh release upload demo-latest "$staged" --clobber; then
-                uploaded="$uploaded $f"
-                echo "已上报命中：m${M}-$(basename "$f")"
-              fi
+              case " $scanned " in *" $f "*) continue ;; esac
+              mine=$((mine+1))
+              report_hit "$f" "$mine" && scanned="$scanned $f" || mine=$((mine-1))
             done
           }
 
           ./vanity-generator > run.log 2>&1 &
           BIN=$!
-          uploaded=""
           killed=0
           prev_line=""
-
-          while kill -0 "$BIN" 2>/dev/null; do
-            upload_new_hits
+          # 循环双保险退出：进程退出 / 达标 / 时限 / 硬超时
+          while kill -0 "$BIN" 2>/dev/null \
+                && [ $(( SECONDS - start )) -lt "$HARD" ]; do
+            scan_new_hits
             # 进度行实时透传（仅变化时打印）
             last_line=$(tail -n 1 run.log 2>/dev/null || true)
             if [ -n "$last_line" ] && [ "$last_line" != "$prev_line" ]; then
               echo "[进度] $last_line"
               prev_line="$last_line"
             fi
-            G=$(hits_on_release)
+            G=$(hits_global)
+            # 每轮心跳：可观测性保证（无命中/无进度时也能看到活着）
+            echo "[心跳] ${SECONDS}s（本机已运行 $(( SECONDS - start ))s）全局 $G/$TARGET"
             if [ "$G" -ge "$TARGET" ]; then
               echo "共同目标达成（全局 $G/$TARGET），本机提前停止"
               killed=1; kill "$BIN"; break
@@ -208,7 +224,7 @@ jobs:
             [ "$N" -gt 10 ] && [ $(( SECONDS - start )) -ge 60 ] && SLEEP=12
             sleep "$SLEEP"
           done
-
+          [ $(( SECONDS - start )) -ge "$HARD" ] && echo "::warning::触发硬超时保险退出"
           # GitHub 的 bash 默认 -e：被 kill 的进程 wait 返回 143，需 || 捕获
           RC=0
           wait "$BIN" 2>/dev/null || RC=$?
@@ -217,20 +233,32 @@ jobs:
             tail -n 15 run.log
             exit 1
           fi
-          upload_new_hits || true
-
-          cp run.log "/tmp/out/log-machine-${M}.log"
-          timeout 30 gh release upload demo-latest "/tmp/out/log-machine-${M}.log" --clobber || true
-
+          scan_new_hits || true
+          cp run.log "log-machine-${M}.log"
+          echo "本机命中：$mine 个（文件见 hits/）"
           echo "===== 本机完整运行日志 ====="
           cat run.log
 
-      - name: 构建产物检查（防路径遗漏）
+      - name: 上传命中密文（若有）
         if: always()
-        run: ls -la vanity_*.asc 2>/dev/null || echo "（本机无命中文件——可能被共同目标提前停止或未命中）"
+        uses: actions/upload-artifact@v4
+        with:
+          name: hits-${{ matrix.machine }}
+          path: hits/
+          if-no-files-found: ignore
+          retention-days: 3
+
+      - name: 上传运行日志
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: log-${{ matrix.machine }}
+          path: log-machine-*.log
+          if-no-files-found: ignore
+          retention-days: 3
 
   publish:
-    name: 整理发布
+    name: 整理发布（有产出才创建 tag 与 Release）
     needs: [setup, search]
     if: always()
     runs-on: ubuntu-latest
@@ -238,19 +266,38 @@ jobs:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       GH_REPO: ${{ github.repository }}
     steps:
-      # ── 进入本任务立即打印全部密文，之后再做汇总与发布 ──
+      # gh --verify-tag 需要 git 上下文
+      - name: 检出仓库
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.setup.outputs.sha }}
+          fetch-depth: 1
+
+      - name: 下载全部机器产物
+        uses: actions/download-artifact@v4
+        with:
+          path: arts
+          pattern: "{hits,log}-*"
+          merge-multiple: true
+
+      - name: 归置产物（密文 / 日志分目录）
+        run: |
+          set -u
+          mkdir -p cipher logs
+          # 机器资产命名：m{机器号}-vanity_*.asc（密文）、log-machine-*.log（日志）
+          find arts -name 'm*-vanity_*.asc' -exec mv {} cipher/ \; 2>/dev/null || true
+          find arts -name 'log-machine-*.log' -exec mv {} logs/ \; 2>/dev/null || true
+          echo "密文：$(find cipher -name '*.asc' | wc -l) 个；日志：$(find logs -name '*.log' | wc -l) 份"
+
       - name: 打印全部 GPG 加密密文（每个密文完整输出一次）
         run: |
           set -u
-          mkdir -p cipher
-          # 下载 demo-latest 上全部命中产物（矩阵资产命名：m{机器号}-vanity_*.asc）
-          timeout 60 gh release download demo-latest --pattern 'm*-vanity_*.asc' --dir cipher 2>/dev/null || true
           total=$(find cipher -name '*.asc' 2>/dev/null | wc -l)
           if [ "$total" -eq 0 ]; then
-            echo "::notice::当前 Release 上暂无 .asc 加密产物，跳过打印，继续后续流程。"
+            echo "::notice::本场无 .asc 加密产物，跳过打印。"
             exit 0
           fi
-          echo "已下载 $total 个加密产物，开始逐个完整打印："
+          echo "共 $total 个加密产物，开始逐个完整打印："
           i=0
           for f in cipher/*.asc; do
             [ -f "$f" ] || continue
@@ -266,41 +313,59 @@ jobs:
           printf '\n'
           echo "共打印 $i 个加密密文；以上 ASCII Armor 密文仅持对应 GPG 私钥者可解密。"
 
-      - name: 汇总与整理（零命中不发布）
+      - name: 汇总与整理（未产出则不创建 tag）
+        env:
+          TAG: ${{ needs.setup.outputs.tag }}
+          SHA: ${{ needs.setup.outputs.sha }}
         run: |
+          set -u
           TARGET=${{ needs.setup.outputs.count }}
-          HITS=$(timeout 15 gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" \
-            --jq '[.assets[].name | select(test("^m[0-9]+-vanity_"))] | length' 2>/dev/null || echo -1)
-          echo "共同目标：$TARGET；全局命中：$HITS"
-
-          if [ "$HITS" -lt 1 ]; then
-            echo "::notice::本次运行未命中任何地址——按约定不发布 Release（删除演示 Release 及全部临时资产）。"
-            timeout 30 gh release delete demo-latest --yes || true
+          HITS=$(find cipher -name '*.asc' 2>/dev/null | wc -l)
+          echo "本场命中：$HITS / 目标 $TARGET"
+          if [ "$HITS" -eq 0 ]; then
+            echo "::notice::本场未命中任何地址——按约定不创建 tag 与 Release（零残留，不影响任何既有发布）。"
             exit 0
           fi
 
-          # 下载 1 号机日志提取难度提示（如有）
-          EXPECT=""
-          if timeout 30 gh release download demo-latest --pattern 'log-machine-*.log' --dir logs 2>/dev/null; then
-            EXPECT=$(grep -h "期望尝试" logs/log-machine-*.log 2>/dev/null | head -1 || true)
-          fi
+          # 难度提示（任一机器日志）
+          EXPECT=$(grep -h "期望尝试" logs/log-machine-*.log 2>/dev/null | head -1 || true)
           echo "规则难度：${EXPECT:-（见各机器日志）}"
-
           STATUS="已完成共同目标"
           [ "$HITS" -lt "$TARGET" ] && STATUS="未在时限内完成共同目标（$HITS/$TARGET）"
+
+          # ── 整理发布阶段：此刻才创建 tag（唯一建 tag 点）──
+          if gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" > /dev/null 2>&1; then
+            echo "tag $TAG 已存在（异常：同运行号重复？跳过建 tag）"
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f ref="refs/tags/$TAG" -f sha="$SHA"
+            echo "已创建 tag $TAG → $SHA"
+          fi
 
           {
             echo "## 靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行"
             echo ""
-            echo "- 并行机器：${{ inputs.machines || '20' }} 台（启动即全力并行）"   # ★ 改动 8：兜底值 8 → 20
+            echo "- 并行机器：${{ inputs.machines || '8' }} 台（启动即全力并行）"
             echo "- 共同目标：$TARGET 个地址（全部机器达标即停）"
             echo "- 状态：$STATUS"
             echo "- ${EXPECT}"
             echo "- 加密产物仅持对应 GPG 私钥者可解密；各机器运行日志见附件 log-machine-*.log"
-            echo "- 本 Release 为预发布（prerelease），固定复用 demo-latest 标签，不占用 Latest"
+            echo "- 本 Release 为预发布（prerelease），对应 tag \`$TAG\`（每场一个 tag，历史可用 cleanup-demo-releases 一键清理）"
           } > notes.md
           cat notes.md
 
-          timeout 30 gh release edit demo-latest \
-            --title "靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行" \
-            --notes-file notes.md --prerelease
+          # ── 创建 Release 并上传产物（--clobber 仅覆盖同名，绝不删除）──
+          gh release create "$TAG" --title "靓号演示（多机并行·共同目标）· 第 ${GITHUB_RUN_NUMBER} 次运行" \
+            --notes-file notes.md --prerelease --verify-tag || true
+          # 上传密文与日志（密文已在上面完整打印过，附件供下载）
+          find cipher -name '*.asc' -exec gh release upload "$TAG" {} --clobber \; || true
+          find logs -name '*.log' -exec gh release upload "$TAG" {} --clobber \; || true
+          gh release edit "$TAG" --draft=false --prerelease || true
+
+          {
+            echo "## 发布完成：$TAG"
+            echo ""
+            echo "- commit：\`$SHA\`"
+            echo "- 命中：$HITS / 目标 $TARGET（$STATUS）"
+            echo "- 本场只创建 demo-run-* tag，未触碰任何版本 tag 与 Release"
+          } >> "$GITHUB_STEP_SUMMARY"

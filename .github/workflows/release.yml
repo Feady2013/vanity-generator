@@ -78,9 +78,16 @@ jobs:
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "目标版本：$TAG"
 
-          # ── 幂等判定 ──
-          TAG_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" --jq .object.sha 2>/dev/null || true)"
-          REL_ASSETS="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '[.assets[].name] | length' 2>/dev/null || echo -1)"
+          # ── 幂等判定（gh api 404 时错误体可能进 stdout，须校验形状）──
+          TAG_SHA="$(gh api "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" --jq '.object.sha' 2>/dev/null || true)"
+          case "$TAG_SHA" in
+            [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) : ;;
+            *) TAG_SHA="" ;;
+          esac
+          REL_ASSETS="$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq '[.assets[].name] | length' 2>/dev/null || true)"
+          case "$REL_ASSETS" in
+            ''|*[!0-9]*) REL_ASSETS=-1 ;;
+          esac
 
           if [ "$GITHUB_EVENT_NAME" = "push" ]; then
             # 手动打 tag 触发（兼容路径）：Release 已存在 → 自动跳过防双跑
@@ -215,6 +222,13 @@ jobs:
     needs: [plan, build]
     runs-on: ubuntu-latest
     steps:
+      # gh 的 --verify-tag 需要本地 git 上下文（读取 tag 指向并比对）
+      - name: 检出仓库（满足 gh 的 git 上下文）
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 1
+
       - name: 下载全部构建产物
         uses: actions/download-artifact@v4
         with:
