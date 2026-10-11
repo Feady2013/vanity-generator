@@ -1,0 +1,118 @@
+name: 清理演示 Release（demo-run-*）
+
+# 一键清理历史演示 tag 与 Release（demo-run-* 前缀，按创建时间保留最近 N 场）。
+#
+# 隔离保证：只处理 demo-run-* 标签（可选加删废弃的 demo-latest），
+# 绝不触碰版本 tag（v*）与版本 Release——先列清单再动手，dry_run 可预览。
+on:
+  workflow_dispatch:
+    inputs:
+      keep:
+        description: 保留最近多少场（demo-run-* 按创建时间倒序）
+        required: false
+        default: "5"
+      dry_run:
+        description: true = 只列出将要删除的对象，不实际删除
+        required: false
+        type: boolean
+        default: false
+      remove_legacy:
+        description: 同时删除废弃的固定标签 demo-latest（v6 起不再使用）
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  cleanup:
+    name: 清理（保留最近 N 场）
+    runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      KEEP: ${{ inputs.keep || '5' }}
+    steps:
+      - name: 清单与删除
+        run: |
+          set -u
+          if ! [ "$KEEP" -ge 0 ] 2>/dev/null; then KEEP=5; fi
+          DRY="${{ inputs.dry_run }}"
+          LEGACY="${{ inputs.remove_legacy }}"
+
+          # ── 白名单：仅 demo-run-* 前缀（+可选 demo-latest），v* 版本永不触碰 ──
+          mapfile -t ALL < <(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.tag_name | startswith("demo-run-")) | [.created_at, .id, .tag_name] | @tsv' 2>/dev/null | sort -r)
+          # 旧的排序键兼容：created_at ISO 字符串排序即时间排序 ✓
+
+          echo "现有 demo-run-* Release：${#ALL[@]} 个，保留最近 $KEEP 场"
+          {
+            echo "## 清理报告"
+            echo ""
+            echo "- demo-run-* 总数：${#ALL[@]}，保留：$KEEP"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          DELETE=("${ALL[@]:$KEEP}")
+          if [ "${#DELETE[@]}" -eq 0 ]; then
+            echo "无需清理（${#ALL[@]} ≤ $KEEP）"
+            echo "- 结果：无需清理" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          for row in "${DELETE[@]}"; do
+            TS=$(cut -f1 <<<"$row"); ID=$(cut -f2 <<<"$row"); TAG=$(cut -f3 <<<"$row")
+            echo "将删除：$TAG（release id=$ID，创建于 $TS）"
+          done
+          {
+            echo "- 将删除："
+            for row in "${DELETE[@]}"; do
+              echo "  - $(cut -f3 <<<"$row")（$(cut -f1 <<<"$row")）"
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$DRY" = "true" ]; then
+            echo "dry_run=true —— 仅预览，未实际删除"
+            echo "- 模式：dry_run（仅预览）" >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          for row in "${DELETE[@]}"; do
+            ID=$(cut -f2 <<<"$row"); TAG=$(cut -f3 <<<"$row")
+            # 删 Release（按 id，避免按 tag 名删除时的二义性）
+            if gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$ID" 2>/dev/null; then
+              echo "已删 Release：$TAG"
+            else
+              echo "::warning::删 Release 失败（可能已不存在）：$TAG"
+            fi
+            # 删 tag（tag 不随 release 删除，须显式清理）
+            if gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/$TAG" 2>/dev/null; then
+              echo "已删 tag：$TAG"
+            else
+              echo "::warning::删 tag 失败（可能已不存在）：$TAG"
+            fi
+          done
+
+          if [ "$LEGACY" = "true" ]; then
+            RID=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/demo-latest" --jq .id 2>/dev/null || true)
+            if [ -n "$RID" ]; then
+              if [ "$DRY" = "true" ]; then
+                echo "（dry_run）将删除废弃的 demo-latest（id=$RID）"
+              else
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/releases/$RID" && echo "已删废弃 Release：demo-latest"
+                gh api -X DELETE "repos/$GITHUB_REPOSITORY/git/refs/tags/demo-latest" 2>/dev/null && echo "已删废弃 tag：demo-latest" || true
+              fi
+            else
+              echo "demo-latest 不存在，无需处理"
+            fi
+          fi
+
+          echo "- 状态：完成" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 校验版本 Release 完好
+        run: |
+          # 防呆复查：版本 tag 的 Release 必须一个不少
+          V_COUNT=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '[.[] | select(.tag_name | test("^v[0-9]"))] | length' 2>/dev/null || echo -1)
+          echo "版本 Release 数：$V_COUNT（清理前后不变才符合预期）"
+          echo "- 版本 Release（v*）：$V_COUNT 个（未受影响）" >> "$GITHUB_STEP_SUMMARY"
