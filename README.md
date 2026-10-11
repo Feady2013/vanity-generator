@@ -267,6 +267,22 @@ docker run --rm --network none -v ./config:/config \
    全并行零延迟；目标数较少时按"单机预计完成时长 ×2.5（上限 45 秒）"
    错峰——该情形总时长本就只有秒级～分钟级，后启机器达标即跳过，
    总命中可精确停在目标数量
+### 版本发布与重新发布规范（2026-10-11 重构）
+
+- **发布方式**：Actions → Release → Run workflow → 填版本号（如 `v0.2.0`，
+  留空自动读 `Cargo.toml`）。流程为 **构建全绿 → publish 阶段才创建 tag
+  与 Release**：构建失败零残留（不产生任何 tag/Release）。
+- **重复发布同一版本**：幂等补传（仅覆盖同名资产），永不删除既有
+  Release；资产已完整时默认跳过，勾选 `force` 强制重建。
+- **旧习惯兼容**：手动 `git push tag v*` 仍可触发；但若该 tag 的
+  Release 已存在会自动跳过（防双跑）。**不建议**删除/强推已发布 tag
+  ——GitHub 平台行为是"删 tag 连带删 Release"，且发生在工作流之前
+  无法拦截。
+- **本地构建验证**：`cargo build --release` 后运行 `./target/release/vanity-generator`；
+  五平台产物由 CI 交叉构建（linux x86_64/aarch64 musl、windows、macos）。
+- 仓库事件流（`GET /repos/{owner}/{repo}/events`）保留全部 Release
+  删除审计记录（DeleteEvent 带操作者与时间）。
+
 4. 演示产物发布在固定的**预发布 Release `demo-latest`**（prerelease，
    不占用 Latest），只复用这一个标签，不随运行次数堆积标签；
    各机器运行日志作为附件（log-machine-*.log）一并发布
