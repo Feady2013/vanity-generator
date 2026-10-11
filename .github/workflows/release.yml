@@ -222,6 +222,13 @@ jobs:
     needs: [plan, build]
     runs-on: ubuntu-latest
     steps:
+      # gh 的 --verify-tag 需要本地 git 上下文（读取 tag 指向并比对）
+      - name: 检出仓库（满足 gh 的 git 上下文）
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.plan.outputs.sha }}
+          fetch-depth: 1
+
       - name: 下载全部构建产物
         uses: actions/download-artifact@v4
         with:
