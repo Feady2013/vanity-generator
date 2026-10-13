@@ -206,11 +206,11 @@ jobs:
             echo "[心跳] ${SECONDS}s（本机已运行 $(( SECONDS - start ))s）全局 $G/$TARGET"
             if [ "$G" -ge "$TARGET" ]; then
               echo "共同目标达成（全局 $G/$TARGET），本机提前停止"
-              killed=1; kill "$BIN"; break
+              killed=1; kill "$BIN" 2>/dev/null || true; break
             fi
             if [ $(( SECONDS - start )) -ge $(( TM * 60 )) ]; then
               echo "达到本机时限 ${TM} 分钟，停止（已命中部分仍保留）"
-              killed=1; kill "$BIN"; break
+              killed=1; kill "$BIN" 2>/dev/null || true; break
             fi
             # 轮询间隔：前 60 秒 3s 决胜；之后 8s，机器数 >10 时 12s（API 配额友好）
             SLEEP=3
