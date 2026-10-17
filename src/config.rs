@@ -6,8 +6,9 @@
 //! 3. 可执行文件同目录的 `config.yaml`。
 //!
 //! GPG 公钥来源优先级：
-//! 1. 环境变量 `VANITY_GPG_KEY`（ASCII armor 公钥的完整内容）；
-//! 2. `gpg_key_file` 字段指定的文件（相对可执行文件目录，后缀名不限）。
+//! 1. `gpg_key_file` 字段指定的文件（相对可执行文件目录，后缀名不限）。
+//!    已填写但文件读不到时直接报错，**不回退**环境变量（防环境变量注入攻击者公钥）。
+//! 2. 环境变量 `VANITY_GPG_KEY`（ASCII armor 公钥的完整内容，CI/容器场景兜底）。
 //!
 //! 校验规则（全部为 fatal error）：
 //! - `word_count` 只允许 12 / 18 / 24；
@@ -113,15 +114,16 @@ pub struct Config {
     pub derive_batch: u32,
     /// 输出目录：跟随 config.yaml 所在目录（env 注入时 = exe 目录）
     pub output_dir: PathBuf,
-    /// GPG 公钥文件路径（env 提供时为 None）
+    /// GPG 公钥文件路径（未填 gpg_key_file、走环境变量兜底时为 None）
     pub gpg_key_path: Option<PathBuf>,
-    /// GPG 公钥内联内容（env 提供时为 Some）
+    /// GPG 公钥内联内容（仅环境变量兜底时为 Some）
     pub gpg_key_inline: Option<String>,
 }
 
 impl Config {
     /// 按优先级加载配置：CLI 路径 > `VANITY_CONFIG` 环境变量 > exe 同目录 config.yaml。
-    /// `gpg_env` 为 `VANITY_GPG_KEY` 的内容（调用方读取环境变量后传入，便于测试）。
+    /// `gpg_env` 为 `VANITY_GPG_KEY` 的内容（调用方读取环境变量后传入，便于测试；
+    /// 仅当 config 未填 `gpg_key_file` 时作为兜底来源生效）。
     pub fn load(cli_path: Option<&Path>, exe_dir: &Path, gpg_env: Option<&str>) -> Result<Self, VanityError> {
         let (text, source, cfg_dir) = match cli_path {
             Some(p) => (
@@ -286,35 +288,38 @@ impl Config {
             ));
         }
 
-        // 7. GPG 公钥来源：环境变量优先，其次 gpg_key_file 文件
-        let (gpg_key_path, gpg_key_inline) = match gpg_env {
-            Some(content) if !content.trim().is_empty() => {
+        // 7. GPG 公钥来源：gpg_key_file 文件优先（配置文件显式指定，防环境变量注入），
+        //    仅当未填写时回退到 VANITY_GPG_KEY 环境变量（CI/容器场景兜底）
+        let (gpg_key_path, gpg_key_inline) = match raw.gpg_key_file.as_deref() {
+            Some(name) if !name.trim().is_empty() => {
+                // 严格语义：file 已填写就必须可用，读不到直接报错，不静默回退到环境变量
+                //（防止路径笔误导致意外改用 env 中可能被注入的公钥）
+                let p = resolve_path(base_dir, name);
+                let content = fs::read_to_string(&p).map_err(|_| VanityError::config(
+                    format!(
+                        "cannot read gpg_key_file \"{name}\" at {}. Please put the public \
+                         key file next to the executable and check the filename.",
+                        p.display()
+                    ),
+                    format!(
+                        "无法读取 gpg_key_file \"{name}\"（路径 {}）。请将公钥文件放在\
+                         可执行文件同目录并核对文件名。",
+                        p.display()
+                    ),
+                ))?;
                 validate_armor_first_line(
                     content.lines().next().unwrap_or(""),
-                    &format!("{ENV_GPG_KEY} 环境变量"),
+                    &format!("gpg_key_file \"{name}\""),
                 )?;
-                (None, Some(content.to_string()))
+                (Some(p), None)
             }
-            _ => match raw.gpg_key_file.as_deref() {
-                Some(name) if !name.trim().is_empty() => {
-                    let p = resolve_path(base_dir, name);
-                    let content = fs::read_to_string(&p).map_err(|_| VanityError::config(
-                        format!(
-                            "cannot read gpg_key_file \"{name}\" at {}. Please put the public \
-                             key file next to the executable and check the filename.",
-                            p.display()
-                        ),
-                        format!(
-                            "无法读取 gpg_key_file \"{name}\"（路径 {}）。请将公钥文件放在\
-                             可执行文件同目录并核对文件名。",
-                            p.display()
-                        ),
-                    ))?;
+            _ => match gpg_env {
+                Some(content) if !content.trim().is_empty() => {
                     validate_armor_first_line(
                         content.lines().next().unwrap_or(""),
-                        &format!("gpg_key_file \"{name}\""),
+                        &format!("{ENV_GPG_KEY} 环境变量"),
                     )?;
-                    (Some(p), None)
+                    (None, Some(content.to_string()))
                 }
                 _ => {
                     return Err(VanityError::config(
@@ -834,18 +839,43 @@ mod tests {
     }
 
     #[test]
-    fn gpg_环境变量_优先于文件() {
+    fn gpg_文件优先于环境变量() {
         let yaml = key_yaml();
         let cfg =
             Config::parse_and_validate(&yaml, &base(), Some("-----BEGIN PGP PUBLIC KEY BLOCK-----\nxxx"))
                 .unwrap();
+        // file 与 env 同设时：文件优先，env 被忽略
+        assert!(cfg.gpg_key_path.unwrap().ends_with("tests/fixtures/fx1024.asc"));
+        assert!(cfg.gpg_key_inline.is_none());
+    }
+
+    #[test]
+    fn gpg_环境变量兜底_未填文件时() {
+        let yaml = String::from("word_count: 12\nfront: \"ab\"\ncount: 1\n");
+        let cfg = Config::parse_and_validate(&yaml, &base(),
+            Some("-----BEGIN PGP PUBLIC KEY BLOCK-----\nxxx")).unwrap();
         assert!(cfg.gpg_key_path.is_none());
         assert!(cfg.gpg_key_inline.is_some());
     }
 
     #[test]
+    fn gpg_文件无效_即使有环境变量_报错不回退() {
+        let yaml = String::from(
+            "word_count: 12\nfront: \"ab\"\ncount: 1\n\
+             gpg_key_file: \"definitely_missing_key.asc\"\n"
+        );
+        // 严格语义：file 已填写但读不到时直接报错，禁止静默回退 env（防注入）
+        let err = Config::parse_and_validate(&yaml, &base(),
+            Some("-----BEGIN PGP PUBLIC KEY BLOCK-----\nxxx")).unwrap_err();
+        assert!(err.en.contains("cannot read gpg_key_file \"definitely_missing_key.asc\""));
+        assert!(err.cn.contains("无法读取 gpg_key_file"));
+    }
+
+    #[test]
     fn gpg_环境变量_首行非法_报错() {
-        let err = Config::parse_and_validate(&key_yaml(), &base(), Some("not armor")).unwrap_err();
+        // 无 file 时 env 是唯一来源，armor 非法必须报错
+        let yaml = String::from("word_count: 12\nfront: \"ab\"\ncount: 1\n");
+        let err = Config::parse_and_validate(&yaml, &base(), Some("not armor")).unwrap_err();
         assert!(err.en.contains(ARMOR_HEADER));
     }
 

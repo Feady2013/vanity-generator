@@ -27,7 +27,8 @@ Apple Silicon）的预编译二进制，解压后与 config.yaml 放在同一目
 也支持环境变量注入（优先级高于同目录文件，适合 CI 与容器）：
 
 - `VANITY_CONFIG`：config.yaml 的**完整内容**
-- `VANITY_GPG_KEY`：GPG 公钥 armor 的**完整内容**（优先于 `gpg_key_file` 字段）
+- `VANITY_GPG_KEY`：GPG 公钥 armor 的**完整内容**（兜底来源；仅当 config.yaml 未填
+  `gpg_key_file` 时生效，配置文件优先以防环境变量注入）
 
 config.yaml 完整示例（仓库根目录同附 `config.example.yaml`）：
 
