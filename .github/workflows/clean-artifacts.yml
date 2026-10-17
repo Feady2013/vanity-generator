@@ -1,0 +1,39 @@
+name: 手动清理全部 Artifacts
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  cleanup:
+    name: 手动清理全部 Artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: 删除全部 Artifacts
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              per_page: 100,
+            });
+
+            let deleted = 0;
+            for (const artifact of artifacts) {
+              await github.rest.actions.deleteArtifact({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                artifact_id: artifact.id,
+              });
+              deleted++;
+              core.info(`Deleted artifact ${artifact.name} (${artifact.id}) created at ${artifact.created_at}`);
+            }
+
+            core.info(`Deleted ${deleted} artifact(s).`);
