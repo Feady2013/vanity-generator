@@ -14,7 +14,7 @@ jobs:
     name: 手动清理全部 Packages
     runs-on: ubuntu-latest
     steps:
-      - name: 删除全部 package 版本与包本体
+      - name: 删除全部 package（版本 + 包本体）
         uses: actions/github-script@v8
         with:
           # 个人账号的 Packages API（/user/packages）不接受 GITHUB_TOKEN，
@@ -30,28 +30,22 @@ jobs:
               per_page: 100,
             });
 
-            let deleted = 0;
-            for (const v of versions) {
-              await github.request('DELETE /user/packages/container/{package_name}/versions/{version_id}', {
-                package_name: pkg,
-                version_id: v.id,
-              });
-              deleted++;
-              core.info(`已删除版本 ${v.id}（${v.name}，创建于 ${v.created_at}）`);
+            if (versions.length === 0) {
+              core.notice('无 package 可清理。');
+              return;
             }
-            core.info(`共删除 ${deleted} 个版本。`);
 
-            // 删光版本后包壳仍挂在 Packages 列表，连包本体一并删除；
-            // 之后 docker push 同名镜像会自动重建包。
-            if (deleted > 0) {
-              try {
-                await github.request('DELETE /user/packages/container/{package_name}', {
-                  package_name: pkg,
-                });
-                core.info(`已删除包本体 ${pkg}`);
-              } catch (e) {
-                core.warning(`包本体删除失败（版本已清空，可忽略）：${e.message}`);
-              }
-            } else {
-              core.notice('无 package 版本可清理。');
+            // 审计日志：记下将被清除的版本
+            for (const v of versions) {
+              const tags = (v.metadata?.container?.tags || []).join(', ') || '(无 tag)';
+              core.info(`将删除版本 ${v.id}（tags: ${tags}，创建于 ${v.created_at}）`);
             }
+
+            // 直接删除包本体（含全部版本）。
+            // GitHub 规则：包的最后一个版本不可单独删（400 "You must delete the
+            // package instead"），整包删除一条 API 搞定且无版本数限制；
+            // 之后 docker push 同名镜像会自动重建包。
+            await github.request('DELETE /user/packages/container/{package_name}', {
+              package_name: pkg,
+            });
+            core.info(`已删除包本体 ${pkg}（含 ${versions.length} 个版本）。`);
