@@ -202,8 +202,6 @@ jobs:
               prev_line="$last_line"
             fi
             G=$(hits_global)
-            # 每轮心跳：可观测性保证（无命中/无进度时也能看到活着）
-            echo "[心跳] ${SECONDS}s（本机已运行 $(( SECONDS - start ))s）全局 $G/$TARGET"
             if [ "$G" -ge "$TARGET" ]; then
               echo "共同目标达成（全局 $G/$TARGET），本机提前停止"
               killed=1; kill "$BIN" 2>/dev/null || true; break
