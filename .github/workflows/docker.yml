@@ -51,7 +51,9 @@ jobs:
           echo "$VER" | grep -Eq '^(v)?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' \
             || { echo "::error::版本号格式应为 0.1.0 或 v0.1.0，收到：$VER"; exit 1; }
           echo "ver=$VER" >> "$GITHUB_OUTPUT"
-          echo "镜像版本号：$VER"
+          # 镜像名必须全小写（owner 含大写时 github.repository 原样拼会炸）
+          echo "repo_lc=${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "镜像版本号：$VER → ghcr.io/${GITHUB_REPOSITORY,,}"
 
       - name: 登录 ghcr.io
         uses: docker/login-action@v3
@@ -66,5 +68,5 @@ jobs:
           context: .
           push: true
           tags: |
-            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.ver }}
-            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ steps.meta.outputs.repo_lc }}:${{ steps.meta.outputs.ver }}
+            ghcr.io/${{ steps.meta.outputs.repo_lc }}:latest
