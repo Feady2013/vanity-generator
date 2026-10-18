@@ -19,8 +19,9 @@ jobs:
         with:
           # 个人账号的 Packages API（/user/packages）不接受 GITHUB_TOKEN，
           # 必须用带 read:packages + delete:packages scope 的 PAT。
+          # 注意 input 名是 github-token（token 不生效 = 403 integration）。
           # 仓库 secret PACKAGE_TOKEN = 仓库所有者的 PAT（包归属随 token 所属账号走）。
-          token: ${{ secrets.PACKAGE_TOKEN }}
+          github-token: ${{ secrets.PACKAGE_TOKEN }}
           script: |
             const pkg = 'vanity-generator';
 
