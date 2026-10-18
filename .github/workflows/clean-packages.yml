@@ -1,0 +1,56 @@
+name: 手动清理全部 Packages
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  cleanup:
+    name: 手动清理全部 Packages
+    runs-on: ubuntu-latest
+    steps:
+      - name: 删除全部 package 版本与包本体
+        uses: actions/github-script@v8
+        with:
+          # 个人账号的 Packages API（/user/packages）不接受 GITHUB_TOKEN，
+          # 必须用带 read:packages + delete:packages scope 的 PAT。
+          # 仓库 secret PACKAGE_TOKEN = 仓库所有者的 PAT（包归属随 token 所属账号走）。
+          token: ${{ secrets.PACKAGE_TOKEN }}
+          script: |
+            const pkg = 'vanity-generator';
+
+            const versions = await github.paginate('GET /user/packages/container/{package_name}/versions', {
+              package_name: pkg,
+              per_page: 100,
+            });
+
+            let deleted = 0;
+            for (const v of versions) {
+              await github.request('DELETE /user/packages/container/{package_name}/versions/{version_id}', {
+                package_name: pkg,
+                version_id: v.id,
+              });
+              deleted++;
+              core.info(`已删除版本 ${v.id}（${v.name}，创建于 ${v.created_at}）`);
+            }
+            core.info(`共删除 ${deleted} 个版本。`);
+
+            // 删光版本后包壳仍挂在 Packages 列表，连包本体一并删除；
+            // 之后 docker push 同名镜像会自动重建包。
+            if (deleted > 0) {
+              try {
+                await github.request('DELETE /user/packages/container/{package_name}', {
+                  package_name: pkg,
+                });
+                core.info(`已删除包本体 ${pkg}`);
+              } catch (e) {
+                core.warning(`包本体删除失败（版本已清空，可忽略）：${e.message}`);
+              }
+            } else {
+              core.notice('无 package 版本可清理。');
+            }

@@ -6,12 +6,14 @@ name: Release
 # 重复发布同一版本 = 幂等补传（覆盖同名资产），永不删除既有 Release。
 # 兼容保留 push tag 触发（老习惯可用）；若该 tag 的 Release 已存在则
 # 自动跳过，避免双跑与误覆盖。
+# 2026-10-18：版本号支持 0.1.0（无 v 前缀，git tag 与镜像 tag 原样使用）；
+# 发布成功后级联 docker.yml 以版本号构建镜像（workflow_call，同 run 内）。
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "版本号（v0.x.y；留空则自动读 Cargo.toml 的 version 加 v 前缀）"
+        description: "版本号（0.1.0 或 v0.1.0；留空则自动读 Cargo.toml 的 version 加 v 前缀）"
         required: false
         type: string
       commit:
@@ -71,9 +73,11 @@ jobs:
             TAG="v$CARGO_VER"
           fi
           case "$TAG" in
-            v[0-9]*) : ;;
-            *) echo "::error::版本号格式应为 v0.x.y，收到：$TAG"; exit 1 ;;
+            v[0-9]*|[0-9]*) : ;;
+            *) echo "::error::版本号格式应为 0.1.0 或 v0.1.0，收到：$TAG"; exit 1 ;;
           esac
+          echo "$TAG" | grep -Eq '^(v)?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' \
+            || { echo "::error::版本号格式应为 0.1.0 或 v0.1.0，收到：$TAG"; exit 1; }
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "目标版本：$TAG"
@@ -280,6 +284,18 @@ jobs:
             echo "- 资产：5 平台（linux x86_64/aarch64 musl、windows x86_64、macos aarch64/x86_64）"
             echo "- 仓库事件流含全部 Release 审计记录（DeleteEvent 带操作者）"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  docker:
+    name: Docker 镜像（版本号 Tag，级联构建）
+    needs: [plan, publish]
+    if: needs.plan.outputs.should_build == 'true'
+    uses: ./.github/workflows/docker.yml
+    with:
+      tag: ${{ needs.plan.outputs.tag }}
+      sha: ${{ needs.plan.outputs.sha }}
+    permissions:
+      contents: read
+      packages: write
 
   skipped:
     name: 幂等跳过说明

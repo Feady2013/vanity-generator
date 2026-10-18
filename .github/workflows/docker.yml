@@ -1,21 +1,57 @@
 name: Docker 镜像构建发布
 
-# 推送 main 或手动触发时构建最小化（scratch 静态）镜像并发布到 ghcr.io。
-# 使用 vendor/ 内置依赖，构建零网络下载（中国大陆友好）。
+# 触发（2026-10-18 改版：新增 Tag 时构建，版本号即镜像 Tag）：
+#   1. workflow_call   —— Release 工作流发布成功后级联调用（同 run 内，GITHUB_TOKEN 即可）
+#   2. workflow_dispatch —— 手动运行，填版本号（如 0.1.0）
+#   3. push tag        —— 兜底：手动 git push 数字/v 开头的 tag 也会构建
+# 镜像 Tag：ghcr.io/<owner>/vanity-generator:<版本号> 与 :latest
 on:
-  push:
-    branches: [main]
+  workflow_call:
+    inputs:
+      tag:
+        description: "镜像版本号（如 0.1.0）"
+        required: true
+        type: string
+      sha:
+        description: "构建的 commit（Release 级联传入；留空 = 事件默认）"
+        required: false
+        type: string
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "镜像版本号（如 0.1.0）"
+        required: true
+        type: string
+  push:
+    tags: ["v*", "[0-9]*"]
 
 permissions:
   contents: read
   packages: write
 
+env:
+  TZ: Asia/Shanghai
+
 jobs:
   build-and-push:
+    name: 构建并推送镜像
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.sha || github.sha }}
+
+      - name: 解析版本号
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          VER="$INPUT_TAG"
+          echo "$VER" | grep -Eq '^(v)?[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?$' \
+            || { echo "::error::版本号格式应为 0.1.0 或 v0.1.0，收到：$VER"; exit 1; }
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "镜像版本号：$VER"
 
       - name: 登录 ghcr.io
         uses: docker/login-action@v3
@@ -24,11 +60,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 构建并推送镜像
+      - name: 构建并推送镜像（版本号 + latest）
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: |
+            ghcr.io/${{ github.repository }}:${{ steps.meta.outputs.ver }}
             ghcr.io/${{ github.repository }}:latest
-            ghcr.io/${{ github.repository }}:${{ github.sha }}
